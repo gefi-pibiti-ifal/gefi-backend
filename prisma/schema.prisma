@@ -1,0 +1,116 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserType {
+  ADMINISTRATOR
+  FISCAL
+}
+
+model User {
+  id                String   @id @default(uuid())
+  full_name         String
+  email             String   @unique
+  password_hash     String
+  siap_registration String?
+  user_type         UserType @default(FISCAL)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  conversations      Conversation[]
+  normativeDocuments NormativeDocument[]
+  systemAudits       SystemAudit[]
+
+  @@map("users")
+}
+
+model Conversation {
+  id         String   @id @default(uuid())
+  user_id    String
+  title      String
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  user               User                 @relation(fields: [user_id], references: [id])
+  interactionHistory InteractionHistory[]
+  feedback           ConversationFeedback?
+
+  @@map("conversations")
+}
+
+model InteractionHistory {
+  id              String   @id @default(uuid())
+  conversation_id String
+  user_query      String
+  ai_response     String
+  created_at      DateTime @default(now())
+
+  conversation    Conversation     @relation(fields: [conversation_id], references: [id])
+  responseSources ResponseSource[]
+
+  @@map("interaction_history")
+}
+
+model ResponseSource {
+  id             String @id @default(uuid())
+  interaction_id String
+  normative_id   String
+
+  interaction InteractionHistory @relation(fields: [interaction_id], references: [id])
+  normative   NormativeDocument  @relation(fields: [normative_id], references: [id])
+
+  @@map("response_sources")
+}
+
+model ConversationFeedback {
+  id              String  @id @default(uuid())
+  conversation_id String  @unique
+  rating          Int
+  accuracy_check  Boolean
+  comment         String?
+
+  conversation Conversation @relation(fields: [conversation_id], references: [id])
+
+  @@map("conversation_feedbacks")
+}
+
+model NormativeDocument {
+  id               String    @id @default(uuid())
+  title            String
+  document_type    String
+  original_content String
+  admin_id         String
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+  deleted_at       DateTime?
+
+  admin           User             @relation(fields: [admin_id], references: [id])
+  responseSources ResponseSource[]
+
+  @@map("normative_documents")
+}
+
+model SystemAudit {
+  id          String   @id @default(uuid())
+  user_id     String
+  action      String
+  entity_name String
+  entity_id   String?
+  details     Json?
+  created_at  DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@map("system_audits")
+}
+

@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: ankane/pgvector
+    container_name: postgres-vector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gefi
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+ # api:
+  #  build: .
+  #  container_name: gefi-api
+  #  restart: always
+  #  ports:
+  #    - "3000:3000"
+  #  environment:
+  #    - PORT=3000
+  #    - DATABASE_URL=postgresql://gefi:gefi_pass@db:5432/gefi_db?schema=public
+  #    - JWT_SECRET=gefi_secret_key_2026
+  #    - OPENAI_API_KEY=\${OPENAI_API_KEY}
+  #  depends_on:
+  #    - db
+
+volumes:
+  postgres_data:
