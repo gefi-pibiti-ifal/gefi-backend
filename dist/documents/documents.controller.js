@@ -19,7 +19,7 @@ const swagger_1 = require("@nestjs/swagger");
 const jwt_auth_guard_1 = require("../auth/jwt-auth.guard");
 const documents_service_1 = require("./documents.service");
 const rag_service_1 = require("../rag/rag.service");
-const pdfModule = require('pdf-parse');
+const pdf_1 = require("@langchain/community/document_loaders/fs/pdf");
 let DocumentsController = class DocumentsController {
     documentsService;
     ragService;
@@ -28,19 +28,40 @@ let DocumentsController = class DocumentsController {
         this.ragService = ragService;
     }
     async upload(file, body, req) {
-        const pdf = pdfModule.default ? pdfModule.default : pdfModule;
-        const pdfData = await pdf(file.buffer);
-        const content = pdfData.text;
+        if (!file?.buffer) {
+            throw new common_1.BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
+        }
+        let content;
+        try {
+            const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
+            const loader = new pdf_1.PDFLoader(blob, { splitPages: false });
+            const docs = await loader.load();
+            content = docs.map((doc) => doc.pageContent).join('\n').trim();
+            if (!content) {
+                throw new common_1.BadRequestException('Não foi possível extrair texto. O PDF pode ser baseado em imagens (digitalizado).');
+            }
+        }
+        catch (err) {
+            if (err instanceof common_1.BadRequestException)
+                throw err;
+            const message = err instanceof Error ? err.message : String(err);
+            throw new common_1.BadRequestException(`Falha na extração pelo LangChain: ${message}`);
+        }
         const document = await this.documentsService.create({
             title: body.title,
             document_type: body.document_type,
             original_content: content,
             admin_id: req.user.id,
         });
-        await this.ragService.indexDocument(content, document.id, document.title);
+        this.ragService
+            .indexDocument(content, document.id, document.title)
+            .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[RAG] Falha ao indexar o documento ${document.id}: ${msg}`);
+        });
         return document;
     }
-    findAll() {
+    async findAll() {
         return this.documentsService.findAll();
     }
 };
@@ -60,7 +81,14 @@ __decorate([
             required: ['title', 'document_type', 'file'],
         },
     }),
-    (0, common_1.UseInterceptors)((0, platform_express_1.FileInterceptor)('file')),
+    (0, common_1.UseInterceptors)((0, platform_express_1.FileInterceptor)('file', {
+        limits: { fileSize: 20 * 1024 * 1024 },
+        fileFilter: (_, file, cb) => {
+            file.mimetype === 'application/pdf'
+                ? cb(null, true)
+                : cb(new common_1.BadRequestException('Apenas ficheiros PDF são permitidos'), false);
+        },
+    })),
     __param(0, (0, common_1.UploadedFile)()),
     __param(1, (0, common_1.Body)()),
     __param(2, (0, common_1.Req)()),
@@ -70,10 +98,10 @@ __decorate([
 ], DocumentsController.prototype, "upload", null);
 __decorate([
     (0, common_1.Get)(),
-    (0, swagger_1.ApiOperation)({ summary: 'Lista todos os documentos' }),
+    (0, swagger_1.ApiOperation)({ summary: 'Lista todos os documentos normativos' }),
     __metadata("design:type", Function),
     __metadata("design:paramtypes", []),
-    __metadata("design:returntype", void 0)
+    __metadata("design:returntype", Promise)
 ], DocumentsController.prototype, "findAll", null);
 exports.DocumentsController = DocumentsController = __decorate([
     (0, swagger_1.ApiTags)('Documentos'),

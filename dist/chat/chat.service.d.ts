@@ -24,8 +24,8 @@ export declare class ChatService {
             };
         } & {
             id: string;
-            interaction_id: string;
             normative_id: string;
+            interaction_id: string;
         })[];
     } & {
         id: string;

@@ -10,15 +10,15 @@ exports.DocumentsModule = void 0;
 const common_1 = require("@nestjs/common");
 const documents_service_1 = require("./documents.service");
 const documents_controller_1 = require("./documents.controller");
-const rag_service_1 = require("../rag/rag.service");
 const prisma_module_1 = require("../prisma/prisma.module");
+const rag_module_1 = require("../rag/rag.module");
 let DocumentsModule = class DocumentsModule {
 };
 exports.DocumentsModule = DocumentsModule;
 exports.DocumentsModule = DocumentsModule = __decorate([
     (0, common_1.Module)({
-        imports: [prisma_module_1.PrismaModule],
-        providers: [documents_service_1.DocumentsService, rag_service_1.RagService],
+        imports: [prisma_module_1.PrismaModule, rag_module_1.RagModule],
+        providers: [documents_service_1.DocumentsService],
         controllers: [documents_controller_1.DocumentsController],
     })
 ], DocumentsModule);

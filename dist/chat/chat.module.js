@@ -10,7 +10,6 @@ exports.ChatModule = void 0;
 const common_1 = require("@nestjs/common");
 const chat_service_1 = require("./chat.service");
 const chat_controller_1 = require("./chat.controller");
-const rag_service_1 = require("../rag/rag.service");
 const prisma_module_1 = require("../prisma/prisma.module");
 let ChatModule = class ChatModule {
 };
@@ -18,7 +17,7 @@ exports.ChatModule = ChatModule;
 exports.ChatModule = ChatModule = __decorate([
     (0, common_1.Module)({
         imports: [prisma_module_1.PrismaModule],
-        providers: [chat_service_1.ChatService, rag_service_1.RagService],
+        providers: [chat_service_1.ChatService],
         controllers: [chat_controller_1.ChatController],
     })
 ], ChatModule);

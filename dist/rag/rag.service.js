@@ -1,68 +1,158 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
 var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
     var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
     if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
     else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
     return c > 3 && r && Object.defineProperty(target, key, r), r;
 };
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __metadata = (this && this.__metadata) || function (k, v) {
     if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
 };
+var RagService_1;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RagService = void 0;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
-let RagService = class RagService {
+const google_genai_1 = require("@langchain/google-genai");
+const textsplitters_1 = require("@langchain/textsplitters");
+const documents_1 = require("@langchain/core/documents");
+const embeddings_1 = require("@langchain/core/embeddings");
+const pgvector_1 = require("@langchain/pgvector");
+const generative_ai_1 = require("@google/generative-ai");
+const dotenv = __importStar(require("dotenv"));
+dotenv.config();
+class NativeGeminiEmbeddings extends embeddings_1.Embeddings {
+    model;
+    constructor(apiKey) {
+        super({});
+        const genAI = new generative_ai_1.GoogleGenerativeAI(apiKey);
+        this.model = genAI.getGenerativeModel({ model: 'gemini-embedding-2' });
+    }
+    async embedDocuments(texts) {
+        return Promise.all(texts.map((t) => this.embedSingle(t)));
+    }
+    async embedQuery(text) {
+        return this.embedSingle(text);
+    }
+    async embedSingle(text) {
+        const result = await this.model.embedContent(text);
+        return result.embedding.values;
+    }
+}
+let RagService = RagService_1 = class RagService {
     prisma;
+    logger = new common_1.Logger(RagService_1.name);
+    vectorStore;
+    llm;
+    embeddings;
     constructor(prisma) {
         this.prisma = prisma;
     }
     async onModuleInit() {
-        console.log('RagService em modo SIMULAÇÃO (sem IA)');
+        const apiKey = process.env.GOOGLE_API_KEY;
+        if (!apiKey) {
+            this.logger.error('Variavel GOOGLE_API_KEY nao encontrada no arquivo .env');
+            return;
+        }
+        this.embeddings = new NativeGeminiEmbeddings(apiKey);
+        this.llm = new google_genai_1.ChatGoogleGenerativeAI({
+            apiKey,
+            model: 'gemini-2.5-flash',
+            temperature: 0.3,
+        });
+        const config = {
+            postgresConnectionOptions: {
+                type: 'postgres',
+                connectionString: process.env.DATABASE_URL,
+            },
+            tableName: 'documentos_vetorizados',
+            columns: {
+                idColumnName: 'id',
+                vectorColumnName: 'embedding',
+                contentColumnName: 'text',
+                metadataColumnName: 'metadata',
+            },
+        };
+        this.vectorStore = await pgvector_1.PGVectorStore.initialize(this.embeddings, config);
+        this.logger.log('RAG Service inicializado com sucesso (PostgreSQL + pgvector)');
     }
     async indexDocument(content, documentId, title) {
-        console.log('[MOCK] Indexando documento:', {
-            documentId,
-            title,
-            contentLength: content?.length,
+        const splitter = new textsplitters_1.RecursiveCharacterTextSplitter({
+            chunkSize: 1000,
+            chunkOverlap: 200,
         });
-        await new Promise((res) => setTimeout(res, 200));
-        return {
-            success: true,
-            message: 'Documento indexado em modo simulação',
-            documentId,
-        };
+        const chunks = await splitter.splitText(content);
+        const documents = chunks.map((chunk) => new documents_1.Document({ pageContent: chunk, metadata: { documentId, title } }));
+        await this.vectorStore.addDocuments(documents);
+        this.logger.log(`Indexado: "${title}" (${documents.length} chunks)`);
+        return { success: true, documentId };
     }
     async query(userQuery, conversationId) {
-        const simulatedAnswer = this.simulateAnswer(userQuery);
-        const interaction = await this.prisma.interactionHistory.create({
+        const queryVec = await this.embeddings.embedQuery(userQuery);
+        const contextDocs = await this.vectorStore.similaritySearchVectorWithScore(queryVec, 5);
+        const contextText = contextDocs.map(([doc]) => doc.pageContent).join('\n\n');
+        const prompt = `Você é um assistente do GeFi. Responda baseando-se APENAS no contexto abaixo.
+Se não souber, diga que não encontrou nos documentos.
+
+Contexto:
+${contextText}
+
+Pergunta: ${userQuery}`;
+        const response = await this.llm.invoke(prompt);
+        const aiResponse = response.content;
+        const uniqueDocIds = Array.from(new Set(contextDocs
+            .map(([doc]) => doc.metadata.documentId)
+            .filter((id) => typeof id === 'string')));
+        await this.prisma.interactionHistory.create({
             data: {
                 conversation_id: conversationId,
                 user_query: userQuery,
-                ai_response: simulatedAnswer,
+                ai_response: aiResponse,
+                responseSources: {
+                    create: uniqueDocIds.map((id) => ({
+                        normative: { connect: { id } },
+                    })),
+                },
             },
         });
-        await this.prisma.responseSource.create({
-            data: {
-                interaction_id: interaction.id,
-                normative_id: '00000000-0000-0000-0000-000000000000',
-            },
-        }).catch(() => {
-        });
-        return simulatedAnswer;
-    }
-    simulateAnswer(query) {
-        const responses = [
-            `🔎 [SIMULAÇÃO] Recebi sua pergunta: "${query}"`,
-            `📌 [MOCK RAG] Processamento concluído para: "${query}"`,
-            `🧠 [TESTE] Sistema funcionando. Query registrada: "${query}"`,
-            `✅ Resposta simulada gerada com sucesso para: "${query}"`,
-        ];
-        return responses[Math.floor(Math.random() * responses.length)];
+        return aiResponse;
     }
 };
 exports.RagService = RagService;
-exports.RagService = RagService = __decorate([
+exports.RagService = RagService = RagService_1 = __decorate([
     (0, common_1.Injectable)(),
     __metadata("design:paramtypes", [prisma_service_1.PrismaService])
 ], RagService);

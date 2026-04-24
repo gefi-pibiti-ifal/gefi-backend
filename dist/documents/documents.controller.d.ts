@@ -4,7 +4,10 @@ export declare class DocumentsController {
     private documentsService;
     private ragService;
     constructor(documentsService: DocumentsService, ragService: RagService);
-    upload(file: Express.Multer.File, body: any, req: any): Promise<{
+    upload(file: Express.Multer.File, body: {
+        title: string;
+        document_type: string;
+    }, req: any): Promise<{
         id: string;
         created_at: Date;
         updated_at: Date;

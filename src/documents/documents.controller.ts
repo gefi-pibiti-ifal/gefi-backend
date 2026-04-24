@@ -7,20 +7,17 @@ import {
   UploadedFile,
   UseGuards,
   Req,
+  BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import {
-  ApiTags,
-  ApiOperation,
-  ApiBearerAuth,
-  ApiConsumes,
-  ApiBody,
-} from '@nestjs/swagger';
+import { ApiBearerAuth, ApiConsumes, ApiBody, ApiTags, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { DocumentsService } from './documents.service';
 import { RagService } from '../rag/rag.service';
 
-const pdfModule = require('pdf-parse');
+// ✅ SOLUÇÃO DEFINITIVA: Usar o Loader oficial do LangChain!
+// Isto ignora os problemas de importação do TS, pois o LangChain lida com o pdf-parse internamente.
+import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 
 @ApiTags('Documentos')
 @ApiBearerAuth()
@@ -46,19 +43,54 @@ export class DocumentsController {
       required: ['title', 'document_type', 'file'],
     },
   })
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: 20 * 1024 * 1024 },
+      fileFilter: (_, file, cb) => {
+        file.mimetype === 'application/pdf'
+          ? cb(null, true)
+          : cb(new BadRequestException('Apenas ficheiros PDF são permitidos'), false);
+      },
+    }),
+  )
   async upload(
     @UploadedFile() file: Express.Multer.File,
-    @Body() body: any,
+    @Body() body: { title: string; document_type: string },
     @Req() req: any,
   ) {
-    const pdf = pdfModule.default ? pdfModule.default : pdfModule;
+    if (!file?.buffer) {
+      throw new BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
+    }
 
-    const pdfData = await pdf(file.buffer);
+    let content: string;
+    
+    try {
+      // ✅ 1. Transformamos o Buffer do Multer num Blob padrão da Web
+      // ✅ CORRETO: Envolver o buffer num Uint8Array para satisfazer o TypeScript
+      const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
+      
+      // ✅ 2. Instanciamos o PDFLoader do LangChain
+      const loader = new PDFLoader(blob, { splitPages: false });
+      
+      // ✅ 3. Extraímos o documento de forma limpa
+      const docs = await loader.load();
+      
+      // Junta todo o conteúdo extraído
+      content = docs.map((doc) => doc.pageContent).join('\n').trim();
 
+      if (!content) {
+        throw new BadRequestException(
+          'Não foi possível extrair texto. O PDF pode ser baseado em imagens (digitalizado).',
+        );
+      }
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      
+      const message = err instanceof Error ? err.message : String(err);
+      throw new BadRequestException(`Falha na extração pelo LangChain: ${message}`);
+    }
 
-    const content = pdfData.text;
-
+    // Gravação na Base de Dados (Prisma)
     const document = await this.documentsService.create({
       title: body.title,
       document_type: body.document_type,
@@ -66,18 +98,20 @@ export class DocumentsController {
       admin_id: req.user.id,
     });
 
-    await this.ragService.indexDocument(
-      content,
-      document.id,
-      document.title,
-    );
+    // Indexação RAG (em background)
+    this.ragService
+      .indexDocument(content, document.id, document.title)
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[RAG] Falha ao indexar o documento ${document.id}: ${msg}`);
+      });
 
     return document;
   }
 
   @Get()
-  @ApiOperation({ summary: 'Lista todos os documentos' })
-  findAll() {
+  @ApiOperation({ summary: 'Lista todos os documentos normativos' })
+  async findAll() {
     return this.documentsService.findAll();
   }
 }
