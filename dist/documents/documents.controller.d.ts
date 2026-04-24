@@ -9,18 +9,18 @@ export declare class DocumentsController {
         document_type: string;
     }, req: any): Promise<{
         id: string;
-        created_at: Date;
-        updated_at: Date;
         title: string;
+        created_at: Date;
         document_type: string;
         original_content: string;
-        deleted_at: Date | null;
         admin_id: string;
+        updated_at: Date;
+        deleted_at: Date | null;
     }>;
     findAll(): Promise<{
         id: string;
-        created_at: Date;
         title: string;
+        created_at: Date;
         document_type: string;
     }[]>;
 }

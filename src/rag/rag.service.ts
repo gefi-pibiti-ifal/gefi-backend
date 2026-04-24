@@ -4,9 +4,8 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { Document } from '@langchain/core/documents';
 import { Embeddings } from '@langchain/core/embeddings';
-import { PGVectorStore } from '@langchain/pgvector'; // ✅ Importação nova
+import { PGVectorStore } from '@langchain/pgvector'; 
 import { PoolConfig } from 'pg';
-import { SimpleMemoryVectorStore } from './simple-memory.store';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import * as dotenv from 'dotenv';
 
