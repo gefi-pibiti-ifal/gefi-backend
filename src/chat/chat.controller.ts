@@ -4,6 +4,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ChatService } from './chat.service';
 import { RagService } from '../rag/rag.service';
 
+
 @ApiTags('Chat RAG')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
@@ -30,6 +31,19 @@ export class ChatController {
   })
   createConversation(@Body() body: { title: string }, @Req() req: any) {
     return this.chatService.createConversation(body.title, req.user.id);
+  }
+
+  @Get('conversations')
+  async getConversations(@Req() req: any) {
+
+    const userId = req.user?.id || req.user?.sub; 
+    
+    return this.chatService.listConversations(userId);
+  }
+
+  @Get('conversations/:id')
+  async getConversation(@Param('id') id: string) {
+    return this.chatService.getConversationWithHistory(id);
   }
 
   @Post('ask')

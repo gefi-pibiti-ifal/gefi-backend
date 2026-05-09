@@ -28,6 +28,13 @@ let ChatController = class ChatController {
     createConversation(body, req) {
         return this.chatService.createConversation(body.title, req.user.id);
     }
+    async getConversations(req) {
+        const userId = req.user?.id || req.user?.sub;
+        return this.chatService.listConversations(userId);
+    }
+    async getConversation(id) {
+        return this.chatService.getConversationWithHistory(id);
+    }
     async ask(body, req) {
         await this.chatService.validateConversation(body.conversation_id, req.user.id);
         const response = await this.ragService.query(body.query, body.conversation_id);
@@ -63,6 +70,20 @@ __decorate([
     __metadata("design:paramtypes", [Object, Object]),
     __metadata("design:returntype", void 0)
 ], ChatController.prototype, "createConversation", null);
+__decorate([
+    (0, common_1.Get)('conversations'),
+    __param(0, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [Object]),
+    __metadata("design:returntype", Promise)
+], ChatController.prototype, "getConversations", null);
+__decorate([
+    (0, common_1.Get)('conversations/:id'),
+    __param(0, (0, common_1.Param)('id')),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String]),
+    __metadata("design:returntype", Promise)
+], ChatController.prototype, "getConversation", null);
 __decorate([
     (0, common_1.Post)('ask'),
     (0, swagger_1.ApiOperation)({ summary: 'Faz uma pergunta ao assistente RAG' }),

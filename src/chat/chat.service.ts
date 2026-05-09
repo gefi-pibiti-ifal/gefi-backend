@@ -22,6 +22,35 @@ export class ChatService {
     return conversation;
   }
 
+  // Adicione este método dentro da classe ChatService
+  async listConversations(userId?: string) {
+   
+    const whereClause = userId ? { user_id: userId } : {};
+
+    return this.prisma.conversation.findMany({
+      where: whereClause,
+      orderBy: {
+        created_at: 'desc', 
+      },
+      select: {
+        id: true,
+        title: true,
+        created_at: true,
+      },
+    });
+  }
+
+  async getConversationWithHistory(id: string) {
+    return this.prisma.conversation.findUnique({
+      where: { id },
+      include: {
+        interactionHistory: {
+          orderBy: { created_at: 'asc' }
+        }
+      }
+    });
+  }
+
   async getHistory(conversation_id: string, user_id: string) {
     await this.validateConversation(conversation_id, user_id);
 

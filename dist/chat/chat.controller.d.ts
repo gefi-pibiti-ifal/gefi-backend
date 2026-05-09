@@ -13,6 +13,26 @@ export declare class ChatController {
         updated_at: Date;
         user_id: string;
     }>;
+    getConversations(req: any): Promise<{
+        id: string;
+        title: string;
+        created_at: Date;
+    }[]>;
+    getConversation(id: string): Promise<({
+        interactionHistory: {
+            id: string;
+            created_at: Date;
+            conversation_id: string;
+            user_query: string;
+            ai_response: string;
+        }[];
+    } & {
+        id: string;
+        title: string;
+        created_at: Date;
+        updated_at: Date;
+        user_id: string;
+    }) | null>;
     ask(body: {
         conversation_id: string;
         query: string;
@@ -29,14 +49,14 @@ export declare class ChatController {
             };
         } & {
             id: string;
-            normative_id: string;
             interaction_id: string;
+            normative_id: string;
         })[];
     } & {
         id: string;
-        user_query: string;
-        ai_response: string;
         created_at: Date;
         conversation_id: string;
+        user_query: string;
+        ai_response: string;
     })[]>;
 }

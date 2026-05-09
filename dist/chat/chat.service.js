@@ -32,6 +32,30 @@ let ChatService = class ChatService {
             throw new common_1.ForbiddenException('Sem permissão');
         return conversation;
     }
+    async listConversations(userId) {
+        const whereClause = userId ? { user_id: userId } : {};
+        return this.prisma.conversation.findMany({
+            where: whereClause,
+            orderBy: {
+                created_at: 'desc',
+            },
+            select: {
+                id: true,
+                title: true,
+                created_at: true,
+            },
+        });
+    }
+    async getConversationWithHistory(id) {
+        return this.prisma.conversation.findUnique({
+            where: { id },
+            include: {
+                interactionHistory: {
+                    orderBy: { created_at: 'asc' }
+                }
+            }
+        });
+    }
     async getHistory(conversation_id, user_id) {
         await this.validateConversation(conversation_id, user_id);
         return this.prisma.interactionHistory.findMany({
