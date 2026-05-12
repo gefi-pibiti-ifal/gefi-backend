@@ -8,9 +8,13 @@ import {
   UseGuards,
   Req,
   BadRequestException,
+  Query,
+  ForbiddenException,
+  Delete,
+  Param,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiBody, ApiTags, ApiOperation } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiConsumes, ApiBody, ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { DocumentsService } from './documents.service';
 import { RagService } from '../rag/rag.service';
@@ -58,6 +62,11 @@ export class DocumentsController {
     @Body() body: { title: string; document_type: string },
     @Req() req: any,
   ) {
+
+    if (req.user.user_type !== 'ADMINISTRADOR') {
+      throw new ForbiddenException('Apenas administradores podem enviar documentos');
+    }
+
     if (!file?.buffer) {
       throw new BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
     }
@@ -110,8 +119,26 @@ export class DocumentsController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'Lista todos os documentos normativos' })
-  async findAll() {
-    return this.documentsService.findAll();
+  @ApiOperation({ summary: 'Lista documentos com paginação e busca' })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'title', required: false, type: String })
+  async findAll(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('title') title?: string,
+  ) {
+    const pageNum = page ? parseInt(page, 10) : 1;
+    const limitNum = limit ? parseInt(limit, 10) : 5;
+    return this.documentsService.findAll(pageNum, limitNum, title);
+  }
+
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard)
+  async remove(@Param('id') id: string, @Req() req: any) {
+    if (req.user.user_type !== 'ADMINISTRADOR') {
+      throw new ForbiddenException('Apenas administradores podem deletar documentos');
+    }
+    return this.documentsService.remove(id);
   }
 }
