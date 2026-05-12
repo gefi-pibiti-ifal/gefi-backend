@@ -13,7 +13,7 @@ datasource db {
 }
 
 enum UserType {
-  ADMINISTRATOR
+  ADMINISTRADOR
   FISCAL
 }
 
