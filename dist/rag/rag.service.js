@@ -107,7 +107,7 @@ let RagService = RagService_1 = class RagService {
             },
         };
         this.vectorStore = await pgvector_1.PGVectorStore.initialize(this.embeddings, config);
-        this.logger.log('RAG Service inicializado com sucesso (PostgreSQL + pgvector)');
+        this.logger.log('RAG Service inicializado com sucesso (Gemma 4 + pgvector)');
     }
     async indexDocument(content, documentId, title) {
         const splitter = new textsplitters_1.RecursiveCharacterTextSplitter({
@@ -132,11 +132,29 @@ ${contextText}
 
 Pergunta: ${userQuery}`;
         const response = await this.llm.invoke(prompt);
-        const aiResponse = response.content;
-        const uniqueDocIds = Array.from(new Set(contextDocs
-            .map(([doc]) => doc.metadata.documentId)
-            .filter((id) => typeof id === 'string')));
-        await this.prisma.interactionHistory.create({
+        let aiResponse = '';
+        if (typeof response.content === 'string') {
+            aiResponse = response.content;
+        }
+        else if (Array.isArray(response.content)) {
+            const textPart = response.content.find((part) => part.type === 'text');
+            aiResponse = textPart && 'text' in textPart
+                ? textPart.text
+                : JSON.stringify(response.content);
+        }
+        if (!aiResponse || aiResponse.trim() === '') {
+            aiResponse = 'Não encontrei informações nos documentos normativos para responder a esta pergunta.';
+        }
+        const sourcesMap = new Map();
+        contextDocs.forEach(([doc]) => {
+            const id = doc.metadata.documentId;
+            if (id && !sourcesMap.has(id)) {
+                sourcesMap.set(id, { id, title: doc.metadata.title });
+            }
+        });
+        const sources = Array.from(sourcesMap.values());
+        const uniqueDocIds = Array.from(sourcesMap.keys());
+        const savedInteraction = await this.prisma.interactionHistory.create({
             data: {
                 conversation_id: conversationId,
                 user_query: userQuery,
@@ -148,7 +166,7 @@ Pergunta: ${userQuery}`;
                 },
             },
         });
-        return aiResponse;
+        return { id: savedInteraction.id, created_at: savedInteraction.created_at, response: aiResponse, sources };
     }
 };
 exports.RagService = RagService;
