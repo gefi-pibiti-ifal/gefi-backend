@@ -8,9 +8,11 @@ export declare class ChatController {
         title: string;
     }, req: any): Promise<{
         id: string;
-        title: string;
         created_at: Date;
         updated_at: Date;
+        title: string;
+        is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     ask(body: {
@@ -34,9 +36,9 @@ export declare class ChatController {
         })[];
     } & {
         id: string;
+        created_at: Date;
         user_query: string;
         ai_response: string;
-        created_at: Date;
         conversation_id: string;
     })[]>;
 }

@@ -7,6 +7,8 @@ export declare class ChatService {
         created_at: Date;
         updated_at: Date;
         title: string;
+        is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     validateConversation(id: string, user_id: string): Promise<{
@@ -14,6 +16,8 @@ export declare class ChatService {
         created_at: Date;
         updated_at: Date;
         title: string;
+        is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     getHistory(conversation_id: string, user_id: string): Promise<({

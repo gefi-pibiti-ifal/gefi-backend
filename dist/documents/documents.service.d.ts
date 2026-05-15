@@ -7,9 +7,9 @@ export declare class DocumentsService {
         created_at: Date;
         updated_at: Date;
         title: string;
+        deleted_at: Date | null;
         document_type: string;
         original_content: string;
-        deleted_at: Date | null;
         admin_id: string;
     }>;
     findAll(): Promise<{
