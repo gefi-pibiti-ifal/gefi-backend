@@ -12,5 +12,10 @@ export declare class RagService implements OnModuleInit {
         success: boolean;
         documentId: string;
     }>;
-    query(userQuery: string, conversationId: string): Promise<string>;
+    query(userQuery: string, conversationId: string): Promise<{
+        id: string;
+        created_at: Date;
+        response: string;
+        sources: any[];
+    }>;
 }

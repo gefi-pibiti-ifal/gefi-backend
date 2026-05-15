@@ -5,13 +5,13 @@ export declare class AuthService {
     private jwtService;
     constructor(usersService: UsersService, jwtService: JwtService);
     register(userData: any): Promise<{
-        id: string;
-        full_name: string;
-        email: string;
-        siap_registration: string | null;
-        user_type: import(".prisma/client").$Enums.UserType;
-        created_at: Date;
-        updated_at: Date;
+        token: string;
+        user: {
+            id: string;
+            full_name: string;
+            email: string;
+            user_type: import(".prisma/client").$Enums.UserType;
+        };
     }>;
     login(email: string, pass: string): Promise<{
         token: string;

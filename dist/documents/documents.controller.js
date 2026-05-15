@@ -28,6 +28,9 @@ let DocumentsController = class DocumentsController {
         this.ragService = ragService;
     }
     async upload(file, body, req) {
+        if (req.user.user_type !== 'ADMINISTRADOR') {
+            throw new common_1.ForbiddenException('Apenas administradores podem enviar documentos');
+        }
         if (!file?.buffer) {
             throw new common_1.BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
         }
@@ -61,8 +64,16 @@ let DocumentsController = class DocumentsController {
         });
         return document;
     }
-    async findAll() {
-        return this.documentsService.findAll();
+    async findAll(page, limit, title) {
+        const pageNum = page ? parseInt(page, 10) : 1;
+        const limitNum = limit ? parseInt(limit, 10) : 5;
+        return this.documentsService.findAll(pageNum, limitNum, title);
+    }
+    async remove(id, req) {
+        if (req.user.user_type !== 'ADMINISTRADOR') {
+            throw new common_1.ForbiddenException('Apenas administradores podem deletar documentos');
+        }
+        return this.documentsService.remove(id);
     }
 };
 exports.DocumentsController = DocumentsController;
@@ -98,11 +109,26 @@ __decorate([
 ], DocumentsController.prototype, "upload", null);
 __decorate([
     (0, common_1.Get)(),
-    (0, swagger_1.ApiOperation)({ summary: 'Lista todos os documentos normativos' }),
+    (0, swagger_1.ApiOperation)({ summary: 'Lista documentos com paginação e busca' }),
+    (0, swagger_1.ApiQuery)({ name: 'page', required: false, type: Number }),
+    (0, swagger_1.ApiQuery)({ name: 'limit', required: false, type: Number }),
+    (0, swagger_1.ApiQuery)({ name: 'title', required: false, type: String }),
+    __param(0, (0, common_1.Query)('page')),
+    __param(1, (0, common_1.Query)('limit')),
+    __param(2, (0, common_1.Query)('title')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", []),
+    __metadata("design:paramtypes", [String, String, String]),
     __metadata("design:returntype", Promise)
 ], DocumentsController.prototype, "findAll", null);
+__decorate([
+    (0, common_1.Delete)(':id'),
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:returntype", Promise)
+], DocumentsController.prototype, "remove", null);
 exports.DocumentsController = DocumentsController = __decorate([
     (0, swagger_1.ApiTags)('Documentos'),
     (0, swagger_1.ApiBearerAuth)(),
