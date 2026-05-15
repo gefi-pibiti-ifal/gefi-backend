@@ -28,24 +28,41 @@ let ChatController = class ChatController {
     createConversation(body, req) {
         return this.chatService.createConversation(body.title, req.user.id);
     }
-    async getConversations(req) {
+    async getConversations(req, page, limit) {
         const userId = req.user?.id || req.user?.sub;
-        return this.chatService.listConversations(userId);
+        const pageNum = page ? parseInt(page, 10) : 1;
+        const limitNum = limit ? parseInt(limit, 10) : 20;
+        return this.chatService.listConversations(userId, pageNum, limitNum);
     }
     async getConversation(id) {
         return this.chatService.getConversationWithHistory(id);
     }
     async ask(body, req) {
         await this.chatService.validateConversation(body.conversation_id, req.user.id);
-        const response = await this.ragService.query(body.query, body.conversation_id);
+        const result = await this.ragService.query(body.query, body.conversation_id);
         return {
-            query: body.query,
-            response: response,
+            id: result.id,
+            created_at: result.created_at,
+            user_query: body.query,
+            ai_response: result.response,
+            sources: result.sources,
             conversation_id: body.conversation_id,
         };
     }
     getHistory(conversation_id, req) {
         return this.chatService.getHistory(conversation_id, req.user.id);
+    }
+    async renameConversation(id, body, req) {
+        await this.chatService.validateConversation(id, req.user.id);
+        return this.chatService.renameConversation(id, body.title);
+    }
+    async togglePin(id, body, req) {
+        await this.chatService.validateConversation(id, req.user.id);
+        return this.chatService.togglePinConversation(id, body.is_pinned);
+    }
+    async softDelete(id, req) {
+        await this.chatService.validateConversation(id, req.user.id);
+        return this.chatService.softDeleteConversation(id);
     }
 };
 exports.ChatController = ChatController;
@@ -55,12 +72,7 @@ __decorate([
     (0, swagger_1.ApiBody)({
         schema: {
             type: 'object',
-            properties: {
-                title: {
-                    type: 'string',
-                    example: 'Consulta sobre legislação ambiental',
-                },
-            },
+            properties: { title: { type: 'string', example: 'Consulta sobre legislação ambiental' } },
             required: ['title'],
         },
     }),
@@ -72,9 +84,14 @@ __decorate([
 ], ChatController.prototype, "createConversation", null);
 __decorate([
     (0, common_1.Get)('conversations'),
+    (0, swagger_1.ApiOperation)({ summary: 'Lista conversas com paginação' }),
+    (0, swagger_1.ApiQuery)({ name: 'page', required: false, type: Number }),
+    (0, swagger_1.ApiQuery)({ name: 'limit', required: false, type: Number }),
     __param(0, (0, common_1.Req)()),
+    __param(1, (0, common_1.Query)('page')),
+    __param(2, (0, common_1.Query)('limit')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [Object]),
+    __metadata("design:paramtypes", [Object, String, String]),
     __metadata("design:returntype", Promise)
 ], ChatController.prototype, "getConversations", null);
 __decorate([
@@ -91,14 +108,8 @@ __decorate([
         schema: {
             type: 'object',
             properties: {
-                conversation_id: {
-                    type: 'string',
-                    example: 'uuid-da-conversa',
-                },
-                query: {
-                    type: 'string',
-                    example: 'Qual é o conteúdo deste documento?',
-                },
+                conversation_id: { type: 'string', example: 'uuid-da-conversa' },
+                query: { type: 'string', example: 'Qual é o conteúdo deste documento?' },
             },
             required: ['conversation_id', 'query'],
         },
@@ -118,6 +129,35 @@ __decorate([
     __metadata("design:paramtypes", [String, Object]),
     __metadata("design:returntype", void 0)
 ], ChatController.prototype, "getHistory", null);
+__decorate([
+    (0, common_1.Patch)('conversations/:id/rename'),
+    (0, swagger_1.ApiOperation)({ summary: 'Renomeia uma conversa' }),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Body)()),
+    __param(2, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object, Object]),
+    __metadata("design:returntype", Promise)
+], ChatController.prototype, "renameConversation", null);
+__decorate([
+    (0, common_1.Patch)('conversations/:id/pin'),
+    (0, swagger_1.ApiOperation)({ summary: 'Fixa ou desfixa uma conversa' }),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Body)()),
+    __param(2, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object, Object]),
+    __metadata("design:returntype", Promise)
+], ChatController.prototype, "togglePin", null);
+__decorate([
+    (0, common_1.Delete)('conversations/:id'),
+    (0, swagger_1.ApiOperation)({ summary: 'Deleta logicamente uma conversa (soft delete)' }),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:returntype", Promise)
+], ChatController.prototype, "softDelete", null);
 exports.ChatController = ChatController = __decorate([
     (0, swagger_1.ApiTags)('Chat RAG'),
     (0, swagger_1.ApiBearerAuth)(),

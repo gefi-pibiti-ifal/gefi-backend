@@ -22,22 +22,46 @@ export class ChatService {
     return conversation;
   }
 
-  // Adicione este método dentro da classe ChatService
-  async listConversations(userId?: string) {
-   
-    const whereClause = userId ? { user_id: userId } : {};
+  async listConversations(userId?: string, page: number = 1, limit: number = 20) {
+    const whereClause = {
+      ...(userId ? { user_id: userId } : {}),
+      deleted_at: null, 
+    };
+    
+    const skip = (page - 1) * limit;
 
-    return this.prisma.conversation.findMany({
-      where: whereClause,
-      orderBy: {
-        created_at: 'desc', 
-      },
-      select: {
-        id: true,
-        title: true,
-        created_at: true,
-      },
-    });
+    const [data, total] = await Promise.all([
+      this.prisma.conversation.findMany({
+        where: whereClause,
+        orderBy: [
+          { is_pinned: 'desc' }, // Fixados aparecem primeiro
+          { created_at: 'desc' }
+        ],
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          title: true,
+          created_at: true,
+          is_pinned: true, // Adicionado para o frontend saber o estado
+        },
+      }),
+      this.prisma.conversation.count({ where: whereClause })
+    ]);
+
+    const totalPages = Math.ceil(total / limit);
+    const hasNextPage = page < totalPages;
+
+    return {
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages,
+        hasNextPage
+      }
+    };
   }
 
   async getConversationWithHistory(id: string) {
@@ -66,6 +90,27 @@ export class ChatService {
           },
         },
       },
+    });
+  }
+  
+  async renameConversation(id: string, title: string) {
+    return this.prisma.conversation.update({
+      where: { id },
+      data: { title },
+    });
+  }
+
+  async togglePinConversation(id: string, is_pinned: boolean) {
+    return this.prisma.conversation.update({
+      where: { id },
+      data: { is_pinned },
+    });
+  }
+
+  async softDeleteConversation(id: string) {
+    return this.prisma.conversation.update({
+      where: { id },
+      data: { deleted_at: new Date() },
     });
   }
 }

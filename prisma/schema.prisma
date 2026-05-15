@@ -40,6 +40,8 @@ model Conversation {
   title      String
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
+  is_pinned  Boolean   @default(false)
+  deleted_at DateTime?
 
   user               User                 @relation(fields: [user_id], references: [id])
   interactionHistory InteractionHistory[]

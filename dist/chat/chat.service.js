@@ -32,19 +32,42 @@ let ChatService = class ChatService {
             throw new common_1.ForbiddenException('Sem permissão');
         return conversation;
     }
-    async listConversations(userId) {
-        const whereClause = userId ? { user_id: userId } : {};
-        return this.prisma.conversation.findMany({
-            where: whereClause,
-            orderBy: {
-                created_at: 'desc',
-            },
-            select: {
-                id: true,
-                title: true,
-                created_at: true,
-            },
-        });
+    async listConversations(userId, page = 1, limit = 20) {
+        const whereClause = {
+            ...(userId ? { user_id: userId } : {}),
+            deleted_at: null,
+        };
+        const skip = (page - 1) * limit;
+        const [data, total] = await Promise.all([
+            this.prisma.conversation.findMany({
+                where: whereClause,
+                orderBy: [
+                    { is_pinned: 'desc' },
+                    { created_at: 'desc' }
+                ],
+                skip,
+                take: limit,
+                select: {
+                    id: true,
+                    title: true,
+                    created_at: true,
+                    is_pinned: true,
+                },
+            }),
+            this.prisma.conversation.count({ where: whereClause })
+        ]);
+        const totalPages = Math.ceil(total / limit);
+        const hasNextPage = page < totalPages;
+        return {
+            data,
+            meta: {
+                page,
+                limit,
+                total,
+                totalPages,
+                hasNextPage
+            }
+        };
     }
     async getConversationWithHistory(id) {
         return this.prisma.conversation.findUnique({
@@ -70,6 +93,24 @@ let ChatService = class ChatService {
                     },
                 },
             },
+        });
+    }
+    async renameConversation(id, title) {
+        return this.prisma.conversation.update({
+            where: { id },
+            data: { title },
+        });
+    }
+    async togglePinConversation(id, is_pinned) {
+        return this.prisma.conversation.update({
+            where: { id },
+            data: { is_pinned },
+        });
+    }
+    async softDeleteConversation(id) {
+        return this.prisma.conversation.update({
+            where: { id },
+            data: { deleted_at: new Date() },
         });
     }
 };
