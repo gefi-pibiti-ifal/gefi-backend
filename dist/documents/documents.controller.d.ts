@@ -10,18 +10,18 @@ export declare class DocumentsController {
     }, req: any): Promise<{
         id: string;
         created_at: Date;
-        updated_at: Date;
         title: string;
-        deleted_at: Date | null;
         document_type: string;
         original_content: string;
         admin_id: string;
+        updated_at: Date;
+        deleted_at: Date | null;
     }>;
     findAll(page?: string, limit?: string, title?: string): Promise<{
         data: {
             id: string;
-            title: string;
             created_at: Date;
+            title: string;
             document_type: string;
         }[];
         meta: {

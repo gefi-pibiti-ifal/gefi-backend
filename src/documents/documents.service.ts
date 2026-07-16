@@ -46,23 +46,31 @@ export class DocumentsService {
     };
   }
 
-  async remove(id: string) {    
+  async remove(id: string) {
     const document = await this.prisma.normativeDocument.findFirst({
-      where: { 
-        id,
-        deleted_at: null 
-      },
+      where: { id, deleted_at: null },
     });
 
     if (!document) {
       throw new NotFoundException('Documento não encontrado ou já removido');
     }
-    
-    return this.prisma.normativeDocument.update({
+
+    // 1. Remove os vetores da tabela do LangChain (pgvector)
+    //    metadata é JSONB — usa o operador ->> para comparar o campo documentId
+    await this.prisma.$executeRaw`
+      DELETE FROM documentos_vetorizados
+      WHERE metadata->>'documentId' = ${id}
+    `;
+
+    // 2. Deleta fisicamente o documento.
+    //    O Cascade no ParentChunk (schema.prisma) apaga os parent_chunks automaticamente.
+    //    O ResponseSource não tem Cascade, então deletamos antes para evitar FK violation.
+    await this.prisma.responseSource.deleteMany({
+      where: { normative_id: id },
+    });
+
+    return this.prisma.normativeDocument.delete({
       where: { id },
-      data: {
-        deleted_at: new Date(),
-      },
     });
   }
 }

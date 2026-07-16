@@ -8,18 +8,18 @@ export declare class ChatController {
         title: string;
     }, req: any): Promise<{
         id: string;
-        title: string;
         created_at: Date;
+        title: string;
         updated_at: Date;
-        is_pinned: boolean;
         deleted_at: Date | null;
+        is_pinned: boolean;
         user_id: string;
     }>;
     getConversations(req: any, page?: string, limit?: string): Promise<{
         data: {
             id: string;
-            title: string;
             created_at: Date;
+            title: string;
             is_pinned: boolean;
         }[];
         meta: {
@@ -34,17 +34,17 @@ export declare class ChatController {
         interactionHistory: {
             id: string;
             created_at: Date;
-            conversation_id: string;
             user_query: string;
             ai_response: string;
+            conversation_id: string;
         }[];
     } & {
         id: string;
-        title: string;
         created_at: Date;
+        title: string;
         updated_at: Date;
-        is_pinned: boolean;
         deleted_at: Date | null;
+        is_pinned: boolean;
         user_id: string;
     }) | null>;
     ask(body: {
@@ -55,7 +55,10 @@ export declare class ChatController {
         created_at: Date;
         user_query: string;
         ai_response: string;
-        sources: any[];
+        sources: {
+            id: string;
+            title: string;
+        }[];
         conversation_id: string;
     }>;
     getHistory(conversation_id: string, req: any): Promise<({
@@ -66,45 +69,45 @@ export declare class ChatController {
             };
         } & {
             id: string;
-            interaction_id: string;
             normative_id: string;
+            interaction_id: string;
         })[];
     } & {
         id: string;
         created_at: Date;
-        conversation_id: string;
         user_query: string;
         ai_response: string;
+        conversation_id: string;
     })[]>;
     renameConversation(id: string, body: {
         title: string;
     }, req: any): Promise<{
         id: string;
-        title: string;
         created_at: Date;
+        title: string;
         updated_at: Date;
-        is_pinned: boolean;
         deleted_at: Date | null;
+        is_pinned: boolean;
         user_id: string;
     }>;
     togglePin(id: string, body: {
         is_pinned: boolean;
     }, req: any): Promise<{
         id: string;
-        title: string;
         created_at: Date;
+        title: string;
         updated_at: Date;
-        is_pinned: boolean;
         deleted_at: Date | null;
+        is_pinned: boolean;
         user_id: string;
     }>;
     softDelete(id: string, req: any): Promise<{
         id: string;
-        title: string;
         created_at: Date;
+        title: string;
         updated_at: Date;
-        is_pinned: boolean;
         deleted_at: Date | null;
+        is_pinned: boolean;
         user_id: string;
     }>;
 }

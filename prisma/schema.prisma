@@ -98,8 +98,22 @@ model NormativeDocument {
 
   admin           User             @relation(fields: [admin_id], references: [id])
   responseSources ResponseSource[]
+  parentChunks    ParentChunk[]
 
   @@map("normative_documents")
+}
+
+model ParentChunk {
+  id             String   @id @default(uuid())
+  document_id    String
+  section_header String
+  content        String
+  metadata       Json     @default("{}")
+  created_at     DateTime @default(now())
+
+  document NormativeDocument @relation(fields: [document_id], references: [id], onDelete: Cascade)
+
+  @@map("parent_chunks")
 }
 
 model SystemAudit {

@@ -55,19 +55,20 @@ let DocumentsService = class DocumentsService {
     }
     async remove(id) {
         const document = await this.prisma.normativeDocument.findFirst({
-            where: {
-                id,
-                deleted_at: null
-            },
+            where: { id, deleted_at: null },
         });
         if (!document) {
             throw new common_1.NotFoundException('Documento não encontrado ou já removido');
         }
-        return this.prisma.normativeDocument.update({
+        await this.prisma.$executeRaw `
+      DELETE FROM documentos_vetorizados
+      WHERE metadata->>'documentId' = ${id}
+    `;
+        await this.prisma.responseSource.deleteMany({
+            where: { normative_id: id },
+        });
+        return this.prisma.normativeDocument.delete({
             where: { id },
-            data: {
-                deleted_at: new Date(),
-            },
         });
     }
 };

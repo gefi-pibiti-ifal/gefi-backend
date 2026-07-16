@@ -19,8 +19,6 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { DocumentsService } from './documents.service';
 import { RagService } from '../rag/rag.service';
 
-// ✅ SOLUÇÃO DEFINITIVA: Usar o Loader oficial do LangChain!
-// Isto ignora os problemas de importação do TS, pois o LangChain lida com o pdf-parse internamente.
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 
 @ApiTags('Documentos')
@@ -74,18 +72,14 @@ export class DocumentsController {
     let content: string;
     
     try {
-      // ✅ 1. Transformamos o Buffer do Multer num Blob padrão da Web
-      // ✅ CORRETO: Envolver o buffer num Uint8Array para satisfazer o TypeScript
+    
       const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
       
-      // ✅ 2. Instanciamos o PDFLoader do LangChain
       const loader = new PDFLoader(blob, { splitPages: false });
-      
-      // ✅ 3. Extraímos o documento de forma limpa
+
       const docs = await loader.load();
       
-      // Junta todo o conteúdo extraído
-      content = docs.map((doc) => doc.pageContent).join('\n').trim();
+      content = docs.map((doc) => doc.pageContent).join('\n\n').trim();
 
       if (!content) {
         throw new BadRequestException(

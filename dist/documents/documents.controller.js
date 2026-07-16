@@ -39,7 +39,7 @@ let DocumentsController = class DocumentsController {
             const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
             const loader = new pdf_1.PDFLoader(blob, { splitPages: false });
             const docs = await loader.load();
-            content = docs.map((doc) => doc.pageContent).join('\n').trim();
+            content = docs.map((doc) => doc.pageContent).join('\n\n').trim();
             if (!content) {
                 throw new common_1.BadRequestException('Não foi possível extrair texto. O PDF pode ser baseado em imagens (digitalizado).');
             }
