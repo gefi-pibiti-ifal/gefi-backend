@@ -1,5 +1,8 @@
 import { OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { Document } from '@langchain/core/documents';
+export declare function normalizeForSearch(text: string): string;
+export declare function buildRagPrompt(contexts: Document[], userQuery: string): string;
 export declare class RagService implements OnModuleInit {
     private prisma;
     private readonly logger;
@@ -15,7 +18,6 @@ export declare class RagService implements OnModuleInit {
         childChunks: number;
     }>;
     private retrieveParentContexts;
-    private buildPrompt;
     query(userQuery: string, conversationId: string): Promise<{
         id: string;
         created_at: Date;

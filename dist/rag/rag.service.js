@@ -44,9 +44,12 @@ var __metadata = (this && this.__metadata) || function (k, v) {
 var RagService_1;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RagService = void 0;
+exports.normalizeForSearch = normalizeForSearch;
+exports.buildRagPrompt = buildRagPrompt;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
 const legal_document_splitter_1 = require("./legal-document-splitter");
+const hierarchical_context_1 = require("./hierarchical-context");
 const google_genai_1 = require("@langchain/google-genai");
 const documents_1 = require("@langchain/core/documents");
 const embeddings_1 = require("@langchain/core/embeddings");
@@ -55,6 +58,15 @@ const generative_ai_1 = require("@google/generative-ai");
 const dotenv = __importStar(require("dotenv"));
 const generative_ai_2 = require("@google/generative-ai");
 dotenv.config();
+const DEBUG_RAG = process.env.DEBUG_RAG === 'true';
+const EMBEDDING_BATCH_SIZE = 15;
+const EMBEDDING_BATCH_DELAY = 10_000;
+const EMBEDDING_RETRY_DELAY = 65_000;
+const EMBEDDING_MAX_RETRIES = 5;
+const MIN_PARENT_CONTENT_LENGTH = 80;
+const SLIDING_WINDOW_BEFORE = 400;
+const SLIDING_WINDOW_AFTER = 800;
+const SLIDING_WINDOW_ANCHOR_SIZES = [50, 40, 30, 20];
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 function chunkArray(arr, size) {
     const batches = [];
@@ -89,20 +101,130 @@ function isStructuralHeading(line) {
         /^T[ÍI]TULO\s+[IVXLCDM]/i.test(line) ||
         /^LIVRO\s+[IVXLCDM]/i.test(line));
 }
+const RE_PDF_NOISE_ALLCAPS = [
+    /^(MINISTÉRIO|SECRETARIA|DIRETORIA|DEPARTAMENTO|COORDENAÇÃO|SUBSECRETARIA|SUPERINTENDÊNCIA|GERENCIA|ASSESSORIA)\b/i,
+    /^[A-Z]{2,5}$/,
+    /^(I{1,3}|IV|VI{0,3}|IX|X{1,3}|XI{1,3}|XIV|XV)$/,
+];
+function isPdfNoiseAllCaps(line) {
+    return RE_PDF_NOISE_ALLCAPS.some(re => re.test(line.trim()));
+}
+function normalizeForSearch(text) {
+    return text.replace(/\s+/g, ' ').trim();
+}
 function cleanExtractedText(raw) {
     return raw
         .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
         .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
         .replace(/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s\/\-\.]{5,80}$/gm, (match) => {
-        if (isStructuralHeading(match.trim()))
+        const trimmed = match.trim();
+        if (isStructuralHeading(trimmed))
             return match;
-        return /[a-záéíóúâêîôûãõç]/.test(match) ? match : '';
+        if (/[a-záéíóúâêîôûãõç]/.test(match))
+            return match;
+        if (isPdfNoiseAllCaps(trimmed))
+            return '';
+        return match;
     })
         .replace(/[_\-\.]{4,}/g, '')
         .replace(/\n{3,}/g, '\n\n')
         .replace(/[ \t]{2,}/g, ' ')
         .replace(/^[ \t]+|[ \t]+$/gm, '')
         .trim();
+}
+function resolveFinishReason(response) {
+    return (response?.finishReason ??
+        response?.response_metadata?.finishReason ??
+        response?.response_metadata?.finish_reason ??
+        response?.generationInfo?.finishReason ??
+        response?.generationInfo?.finish_reason ??
+        'unknown');
+}
+function buildRagPrompt(contexts, userQuery) {
+    const contextBlock = contexts
+        .map((doc, i) => {
+        const section = doc.metadata.sectionHeader;
+        const n2 = doc.metadata.n2_header;
+        const label = n2 && n2 !== section ? `${section} — ${n2}` : section;
+        return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
+    })
+        .join('\n\n---\n\n');
+    return `Voce e um assistente especializado em documentos normativos e administrativos.
+
+Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
+
+REGRAS OBRIGATORIAS:
+
+1. FONTE PRINCIPAL
+   Use o Documento Ref 1 como fonte primaria.
+   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
+   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
+
+2. FIDELIDADE AO TEXTO
+   Preserve a redacao original do documento.
+   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
+   A fidelidade ao texto tem prioridade sobre reformulacoes stilisticas.
+
+3. PRESERVACAO DE LISTAS
+   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
+   - reproduza todos os itens sem excecao;
+   - mantenha exatamente a ordem original;
+   - nao reorganize, nao agrupe e nao omita nenhum item;
+   - nao crie novos itens.
+   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
+
+4. NAO TRUNCAR CONTEUDO
+   Nunca interrompa frases, dispositivos legais ou referencias normativas.
+   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
+   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
+
+5. FORMATO DA RESPOSTA
+   Utilize preferencialmente:
+   - Uma frase de introducao curta.
+   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
+   Evite blocos longos de texto corrido.
+
+6. CITACAO OBRIGATORIA
+   Ao final da resposta, informe a referencia de forma especifica:
+
+   Fonte:
+   - Documento Ref X — Item X.X (titulo do item, se houver)
+
+   Se mais de um documento foi utilizado:
+   Fonte:
+   - Documento Ref 1 — Item X.X (titulo)
+   - Documento Ref 3 — Item Y.Y (titulo)
+
+   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
+
+7. PROIBICOES
+   Nao inclua:
+   - interpretacoes juridicas;
+   - comentarios ou observacoes extras;
+   - exemplos nao presentes no documento;
+   - recomendacoes;
+   - contexto historico;
+   - explicacoes adicionais nao solicitadas.
+   Responda apenas ao que foi perguntado.
+
+8. AUSENCIA DE INFORMACAO
+   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
+   "As informacoes disponiveis nao sao suficientes."
+
+9. SINTESE DE CONTEXTO RELACIONADO
+   Se os documentos recuperados pertencerem ao mesmo contexto estrutural ou n1_header,
+   sintetize as informacoes complementares.
+   preserve a origem de cada informacao indicando o item correspondente.
+   Nao repita conteudos identicos.
+   Nao ignore documentos relacionados recuperados.
+
+--- INICIO DOS DOCUMENTOS DE REFERENCIA ---
+${contextBlock}
+--- FIM DOS DOCUMENTOS DE REFERENCIA ---
+
+Pergunta: ${userQuery}
+
+Resposta:`;
 }
 let RagService = RagService_1 = class RagService {
     prisma;
@@ -252,7 +374,8 @@ let RagService = RagService_1 = class RagService {
         const parentIds = new Set();
         const orderedParentIds = [];
         const sourceDocIds = new Set();
-        for (const [child] of childResults) {
+        const scoreByParentId = new Map();
+        for (const [child, score] of childResults) {
             const parentId = child.metadata.parentId;
             const docId = child.metadata.documentId;
             if (parentId && !parentIds.has(parentId)) {
@@ -261,6 +384,8 @@ let RagService = RagService_1 = class RagService {
             }
             if (docId)
                 sourceDocIds.add(docId);
+            if (parentId)
+                scoreByParentId.set(parentId, score);
         }
         console.log('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
         orderedParentIds.forEach((pid, i) => console.log(`  ${i + 1} -> ${pid}`));
@@ -268,9 +393,82 @@ let RagService = RagService_1 = class RagService {
             where: { id: { in: orderedParentIds } },
         });
         const parentMap = new Map(parentRows.map(row => [row.id, row]));
-        const orderedParentRows = orderedParentIds
+        let orderedParentRows = orderedParentIds
             .map(id => parentMap.get(id))
-            .filter(row => row && row.content.length >= 80);
+            .filter(row => row && row.content.length >= MIN_PARENT_CONTENT_LENGTH);
+        const siblingExpansionGroups = new Map();
+        for (const row of orderedParentRows) {
+            const n2Header = (0, hierarchical_context_1.getN2Header)(row);
+            const prefixInfo = (0, hierarchical_context_1.deriveSiblingPrefix)(n2Header);
+            if (!prefixInfo)
+                continue;
+            const groupKey = `${row.document_id}|||${(0, hierarchical_context_1.getN1Header)(row)}|||${prefixInfo.parentPrefix}|||${prefixInfo.level}`;
+            const score = scoreByParentId.get(row.id) ?? Infinity;
+            const existingGroup = siblingExpansionGroups.get(groupKey);
+            if (!existingGroup) {
+                siblingExpansionGroups.set(groupKey, {
+                    documentId: row.document_id,
+                    n1Header: (0, hierarchical_context_1.getN1Header)(row),
+                    parentPrefix: prefixInfo.parentPrefix,
+                    parentNumbers: prefixInfo.parentNumbers,
+                    level: prefixInfo.level,
+                    bestScore: score,
+                    retrievedIds: new Set([row.id]),
+                });
+            }
+            else {
+                existingGroup.retrievedIds.add(row.id);
+                existingGroup.bestScore = Math.min(existingGroup.bestScore, score);
+            }
+        }
+        if (siblingExpansionGroups.size > 0) {
+            const siblingParents = [];
+            for (const group of siblingExpansionGroups.values()) {
+                const candidates = await this.prisma.parentChunk.findMany({
+                    where: {
+                        document_id: group.documentId,
+                        metadata: { path: ['n1_header'], equals: group.n1Header },
+                        section_header: { startsWith: group.parentPrefix },
+                    },
+                });
+                for (const candidate of candidates) {
+                    if (group.retrievedIds.has(candidate.id))
+                        continue;
+                    if (candidate.content.length < MIN_PARENT_CONTENT_LENGTH)
+                        continue;
+                    const candidateHeader = (0, hierarchical_context_1.getN2Header)(candidate);
+                    const parsedCandidate = (0, legal_document_splitter_1.parseItemNumber)(candidateHeader);
+                    if (!parsedCandidate || parsedCandidate.level !== group.level)
+                        continue;
+                    if (!group.parentNumbers.every((value, idx) => parsedCandidate.numbers[idx] === value))
+                        continue;
+                    siblingParents.push(candidate);
+                    scoreByParentId.set(candidate.id, group.bestScore);
+                }
+            }
+            if (siblingParents.length > 0) {
+                const parentsByGroup = new Map();
+                const groupOrder = [];
+                const appendParent = (parent) => {
+                    const key = `${parent.document_id}|||${(0, hierarchical_context_1.getN1Header)(parent)}`;
+                    if (!parentsByGroup.has(key)) {
+                        parentsByGroup.set(key, []);
+                        groupOrder.push(key);
+                    }
+                    const groupRows = parentsByGroup.get(key);
+                    if (!groupRows.some((row) => row.id === parent.id)) {
+                        groupRows.push(parent);
+                    }
+                };
+                orderedParentRows.forEach(appendParent);
+                siblingParents.forEach(appendParent);
+                orderedParentRows = groupOrder.flatMap((key) => (0, hierarchical_context_1.sortParentsByStructuralOrder)(parentsByGroup.get(key)));
+            }
+        }
+        const clusters = (0, hierarchical_context_1.buildClusters)(orderedParentRows, scoreByParentId);
+        const boostedClusters = (0, hierarchical_context_1.applyHierarchicalBoost)(clusters);
+        const boostedParents = (0, hierarchical_context_1.flattenClusters)(boostedClusters);
+        const parentsToUse = boostedParents.length ? boostedParents : orderedParentRows;
         console.log('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
         parentRows.forEach((row, i) => console.log(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`));
         const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
@@ -285,7 +483,7 @@ let RagService = RagService_1 = class RagService {
             if (pid && !triggeringChildByParentId.has(pid))
                 triggeringChildByParentId.set(pid, child);
         }
-        const parents = orderedParentRows.map((row) => {
+        const parents = parentsToUse.map((row) => {
             const triggeringChild = triggeringChildByParentId.get(row.id);
             let pageContent = row.content;
             if (triggeringChild) {
@@ -316,88 +514,9 @@ let RagService = RagService_1 = class RagService {
         parents.forEach((doc, i) => console.log(`  [Documento Ref ${i + 1}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`));
         return { parents, sourceDocIds: Array.from(sourceDocIds) };
     }
-    buildPrompt(contexts, userQuery) {
-        const contextBlock = contexts
-            .map((doc, i) => {
-            const section = doc.metadata.sectionHeader;
-            const n2 = doc.metadata.n2_header;
-            const label = n2 && n2 !== section ? `${section} — ${n2}` : section;
-            return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
-        })
-            .join('\n\n---\n\n');
-        return `Voce e um assistente especializado em documentos normativos e administrativos.
-
-Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
-
-REGRAS OBRIGATORIAS:
-
-1. FONTE PRINCIPAL
-   Use o Documento Ref 1 como fonte primaria.
-   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
-   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
-
-2. FIDELIDADE AO TEXTO
-   Preserve a redacao original do documento.
-   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
-   A fidelidade ao texto tem prioridade sobre reformulacoes estilisticas.
-
-3. PRESERVACAO DE LISTAS
-   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
-   - reproduza todos os itens sem excecao;
-   - mantenha exatamente a ordem original;
-   - nao reorganize, nao agrupe e nao omita nenhum item;
-   - nao crie novos itens.
-   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
-
-4. NAO TRUNCAR CONTEUDO
-   Nunca interrompa frases, dispositivos legais ou referencias normativas.
-   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
-   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
-
-5. FORMATO DA RESPOSTA
-   Utilize preferencialmente:
-   - Uma frase de introducao curta.
-   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
-   Evite blocos longos de texto corrido.
-
-6. CITACAO OBRIGATORIA
-   Ao final da resposta, informe a referencia de forma especifica:
-
-   Fonte:
-   - Documento Ref X — Item X.X (titulo do item, se houver)
-
-   Se mais de um documento foi utilizado:
-   Fonte:
-   - Documento Ref 1 — Item X.X (titulo)
-   - Documento Ref 3 — Item Y.Y (titulo)
-
-   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
-
-7. PROIBICOES
-   Nao inclua:
-   - interpretacoes juridicas;
-   - comentarios ou observacoes extras;
-   - exemplos nao presentes no documento;
-   - recomendacoes;
-   - contexto historico;
-   - explicacoes adicionais nao solicitadas.
-   Responda apenas ao que foi perguntado.
-
-8. AUSENCIA DE INFORMACAO
-   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
-   "As informacoes disponiveis nao sao suficientes."
-
---- INICIO DOS DOCUMENTOS DE REFERENCIA ---
-${contextBlock}
---- FIM DOS DOCUMENTOS DE REFERENCIA ---
-
-Pergunta: ${userQuery}
-
-Resposta:`;
-    }
     async query(userQuery, conversationId) {
         const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery, 5);
-        const prompt = this.buildPrompt(parents, userQuery);
+        const prompt = buildRagPrompt(parents, userQuery);
         let aiResponse = '';
         try {
             const response = await this.llm.invoke(prompt);

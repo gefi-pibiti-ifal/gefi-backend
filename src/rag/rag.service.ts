@@ -1,6 +1,16 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { splitLegalDocument } from './legal-document-splitter';
+import { splitLegalDocument, parseItemNumber } from './legal-document-splitter';
+import {
+  buildClusters,
+  applyHierarchicalBoost,
+  flattenClusters,
+  getN1Header,
+  getN2Header,
+  sortParentsByStructuralOrder,
+  deriveSiblingPrefix,
+  type ParentChunkRow,
+} from './hierarchical-context';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { Document } from '@langchain/core/documents';
 import { Embeddings } from '@langchain/core/embeddings';
@@ -11,6 +21,29 @@ import * as dotenv from 'dotenv';
 import { HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
 
 dotenv.config();
+
+// Flag de debug: ativa logs TRACE detalhados do pipeline RAG.
+// Uso: DEBUG_RAG=true npm run start:dev
+const DEBUG_RAG = process.env.DEBUG_RAG === 'true';
+
+// ---------------------------------------------------------------------------
+// Constantes do pipeline RAG
+// ---------------------------------------------------------------------------
+
+// Ingestão
+const EMBEDDING_BATCH_SIZE  = 15;
+const EMBEDDING_BATCH_DELAY = 10_000; // ms entre lotes
+const EMBEDDING_RETRY_DELAY = 65_000; // ms após rate-limit 429
+const EMBEDDING_MAX_RETRIES = 5;
+
+// Filtro de qualidade dos ParentChunks
+const MIN_PARENT_CONTENT_LENGTH = 80;
+
+// Janela deslizante
+const SLIDING_WINDOW_BEFORE        = 400;
+const SLIDING_WINDOW_AFTER         = 800;
+// Tamanhos do anchor tentados em ordem decrescente (fallback progressivo)
+const SLIDING_WINDOW_ANCHOR_SIZES  = [50, 40, 30, 20] as const;
 
 // ---------------------------------------------------------------------------
 // Helpers de throttling
@@ -63,6 +96,49 @@ function isStructuralHeading(line: string): boolean {
   );
 }
 
+// Padrões de ruído típico de PDF que devem ser removidos mesmo em ALL-CAPS.
+// Critério: linhas que são claramente artefatos de paginação ou cabeçalhos
+// repetitivos, não conteúdo normativo.
+// Exemplos removidos: "MINISTÉRIO DA FAZENDA", "SECRETARIA DE ESTADO",
+//   "DIRETORIA DE CONTRATOS" (cabeçalhos de rodapé/cabeçalho de página)
+// Exemplos preservados: "DAS OBRIGAÇÕES DO CONTRATADO", "DO PAGAMENTO",
+//   "OBJETO", "DA EXECUÇÃO CONTRATUAL"
+//
+// Heurística: remove apenas linhas ALL-CAPS que NÃO contêm palavras
+// normativas típicas de títulos de seção (prepositions: DA, DO, DAS, DOS,
+// DE, DO, NO, NA, NOS, NAS + subst. como OBJETO, PRAZO, GARANTIA, etc.).
+// Em vez de whitelist, usa blacklist de padrões de ruído conhecidos.
+const RE_PDF_NOISE_ALLCAPS = [
+  // Cabeçalhos institucionais: órgãos, ministérios, secretarias, diretorias
+  /^(MINISTÉRIO|SECRETARIA|DIRETORIA|DEPARTAMENTO|COORDENAÇÃO|SUBSECRETARIA|SUPERINTENDÊNCIA|GERENCIA|ASSESSORIA)\b/i,
+  // Linhas que são apenas siglas (2-5 letras maiúsculas sem espaço, sem acentos)
+  // Ex: CGU, TCU, STF, ANTT — mas não "OBJETO", "PRAZO"
+  /^[A-Z]{2,5}$/,
+  // Linhas que são apenas números romanos isolados (artefato de PDF)
+  /^(I{1,3}|IV|VI{0,3}|IX|X{1,3}|XI{1,3}|XIV|XV)$/,
+];
+
+function isPdfNoiseAllCaps(line: string): boolean {
+  return RE_PDF_NOISE_ALLCAPS.some(re => re.test(line.trim()));
+}
+
+// ---------------------------------------------------------------------------
+// normalizeForSearch
+//
+// Normaliza whitespace para busca de substring.
+// Substitui qualquer sequência de whitespace (espaços, tabs, quebras de linha)
+// por um único espaço e remove espaços nas extremidades.
+//
+// Preserva: acentos, letras, pontuação.
+// Não altera: conteúdo semântico.
+//
+// Uso: comparar anchor (do child chunk) com o conteúdo do parent,
+// eliminando falhas causadas por diferenças de formatação de PDF.
+// ---------------------------------------------------------------------------
+export function normalizeForSearch(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 // ---------------------------------------------------------------------------
 // Limpeza pre-chunking
 // ---------------------------------------------------------------------------
@@ -71,8 +147,15 @@ function cleanExtractedText(raw: string): string {
     .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
     .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
     .replace(/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s\/\-\.]{5,80}$/gm, (match) => {
-      if (isStructuralHeading(match.trim())) return match;
-      return /[a-záéíóúâêîôûãõç]/.test(match) ? match : '';
+      const trimmed = match.trim();
+      // Sempre preserva cabeçalhos estruturais que a máquina de estados precisa
+      if (isStructuralHeading(trimmed)) return match;
+      // Preserva linhas com letras minúsculas (não são ALL-CAPS)
+      if (/[a-záéíóúâêîôûãõç]/.test(match)) return match;
+      // Remove apenas ruído de PDF conhecido; preserva títulos normativos
+      if (isPdfNoiseAllCaps(trimmed)) return '';
+      // Preserva títulos ALL-CAPS que parecem conteúdo normativo
+      return match;
     })
     .replace(/[_\-\.]{4,}/g, '')
     .replace(/\n{3,}/g, '\n\n')
@@ -82,8 +165,117 @@ function cleanExtractedText(raw: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// RagService
+// resolveFinishReason
+//
+// Lê o finishReason na ordem de precedência correta para o adapter
+// LangChain/Gemini, que pode expor o campo em locais diferentes dependendo
+// da versão do SDK:
+//   1. response.finishReason          (campo direto, algumas versões)
+//   2. response_metadata.finishReason (camelCase — padrão atual do Gemini)
+//   3. response_metadata.finish_reason (snake_case — fallback)
+//   4. generationInfo.finishReason
+//   5. generationInfo.finish_reason
+//   6. 'unknown'
 // ---------------------------------------------------------------------------
+function resolveFinishReason(response: any): string {
+  return (
+    response?.finishReason                          ??
+    response?.response_metadata?.finishReason       ??
+    response?.response_metadata?.finish_reason      ??
+    response?.generationInfo?.finishReason          ??
+    response?.generationInfo?.finish_reason         ??
+    'unknown'
+  );
+}
+
+export function buildRagPrompt(contexts: Document[], userQuery: string): string {
+  const contextBlock = contexts
+    .map((doc, i) => {
+      const section = doc.metadata.sectionHeader as string;
+      const n2      = doc.metadata.n2_header     as string;
+      const label   = n2 && n2 !== section ? `${section} — ${n2}` : section;
+      return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
+    })
+    .join('\n\n---\n\n');
+
+  return `Voce e um assistente especializado em documentos normativos e administrativos.
+
+Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
+
+REGRAS OBRIGATORIAS:
+
+1. FONTE PRINCIPAL
+   Use o Documento Ref 1 como fonte primaria.
+   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
+   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
+
+2. FIDELIDADE AO TEXTO
+   Preserve a redacao original do documento.
+   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
+   A fidelidade ao texto tem prioridade sobre reformulacoes stilisticas.
+
+3. PRESERVACAO DE LISTAS
+   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
+   - reproduza todos os itens sem excecao;
+   - mantenha exatamente a ordem original;
+   - nao reorganize, nao agrupe e nao omita nenhum item;
+   - nao crie novos itens.
+   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
+
+4. NAO TRUNCAR CONTEUDO
+   Nunca interrompa frases, dispositivos legais ou referencias normativas.
+   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
+   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
+
+5. FORMATO DA RESPOSTA
+   Utilize preferencialmente:
+   - Uma frase de introducao curta.
+   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
+   Evite blocos longos de texto corrido.
+
+6. CITACAO OBRIGATORIA
+   Ao final da resposta, informe a referencia de forma especifica:
+
+   Fonte:
+   - Documento Ref X — Item X.X (titulo do item, se houver)
+
+   Se mais de um documento foi utilizado:
+   Fonte:
+   - Documento Ref 1 — Item X.X (titulo)
+   - Documento Ref 3 — Item Y.Y (titulo)
+
+   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
+
+7. PROIBICOES
+   Nao inclua:
+   - interpretacoes juridicas;
+   - comentarios ou observacoes extras;
+   - exemplos nao presentes no documento;
+   - recomendacoes;
+   - contexto historico;
+   - explicacoes adicionais nao solicitadas.
+   Responda apenas ao que foi perguntado.
+
+8. AUSENCIA DE INFORMACAO
+   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
+   "As informacoes disponiveis nao sao suficientes."
+
+9. SINTESE DE CONTEXTO RELACIONADO
+   Se os documentos recuperados pertencerem ao mesmo contexto estrutural ou n1_header,
+   sintetize as informacoes complementares.
+   preserve a origem de cada informacao indicando o item correspondente.
+   Nao repita conteudos identicos.
+   Nao ignore documentos relacionados recuperados.
+
+--- INICIO DOS DOCUMENTOS DE REFERENCIA ---
+${contextBlock}
+--- FIM DOS DOCUMENTOS DE REFERENCIA ---
+
+Pergunta: ${userQuery}
+
+Resposta:`;
+}
+
 @Injectable()
 export class RagService implements OnModuleInit {
   private readonly logger = new Logger(RagService.name);
@@ -284,7 +476,8 @@ export class RagService implements OnModuleInit {
     const parentIds       = new Set<string>();
     const orderedParentIds: string[] = [];
     const sourceDocIds    = new Set<string>();
-    for (const [child] of childResults) {
+    const scoreByParentId = new Map<string, number>();
+    for (const [child, score] of childResults) {
       const parentId = child.metadata.parentId as string | undefined;
       const docId    = child.metadata.documentId as string | undefined;
       if (parentId && !parentIds.has(parentId)) {
@@ -292,6 +485,7 @@ export class RagService implements OnModuleInit {
         orderedParentIds.push(parentId);
       }
       if (docId) sourceDocIds.add(docId);
+      if (parentId) scoreByParentId.set(parentId, score);
     }
 
     // [TRACE 4] Ordem de insercao dos parentIds no Set
@@ -303,9 +497,100 @@ export class RagService implements OnModuleInit {
     });
 
     const parentMap = new Map(parentRows.map(row => [row.id, row]));
-    const orderedParentRows = orderedParentIds
+    let orderedParentRows = orderedParentIds
       .map(id => parentMap.get(id)!)
-      .filter(row => row && row.content.length >= 80);
+      .filter(row => row && row.content.length >= MIN_PARENT_CONTENT_LENGTH);
+
+    const siblingExpansionGroups = new Map<string, {
+      documentId: string;
+      n1Header: string;
+      parentPrefix: string;
+      parentNumbers: number[];
+      level: number;
+      bestScore: number;
+      retrievedIds: Set<string>;
+    }>();
+
+    for (const row of orderedParentRows) {
+      const n2Header = getN2Header(row);
+      const prefixInfo = deriveSiblingPrefix(n2Header);
+      if (!prefixInfo) continue;
+
+      const groupKey = `${row.document_id}|||${getN1Header(row)}|||${prefixInfo.parentPrefix}|||${prefixInfo.level}`;
+      const score = scoreByParentId.get(row.id) ?? Infinity;
+      const existingGroup = siblingExpansionGroups.get(groupKey);
+
+      if (!existingGroup) {
+        siblingExpansionGroups.set(groupKey, {
+          documentId: row.document_id,
+          n1Header: getN1Header(row),
+          parentPrefix: prefixInfo.parentPrefix,
+          parentNumbers: prefixInfo.parentNumbers,
+          level: prefixInfo.level,
+          bestScore: score,
+          retrievedIds: new Set([row.id]),
+        });
+      } else {
+        existingGroup.retrievedIds.add(row.id);
+        existingGroup.bestScore = Math.min(existingGroup.bestScore, score);
+      }
+    }
+
+    if (siblingExpansionGroups.size > 0) {
+      const siblingParents: ParentChunkRow[] = [];
+
+      for (const group of siblingExpansionGroups.values()) {
+        const candidates = await this.prisma.parentChunk.findMany({
+          where: {
+            document_id: group.documentId,
+            metadata: { path: ['n1_header'], equals: group.n1Header },
+            section_header: { startsWith: group.parentPrefix },
+          },
+        });
+
+        for (const candidate of candidates) {
+          if (group.retrievedIds.has(candidate.id)) continue;
+          if (candidate.content.length < MIN_PARENT_CONTENT_LENGTH) continue;
+
+          const candidateHeader = getN2Header(candidate);
+          const parsedCandidate = parseItemNumber(candidateHeader);
+          if (!parsedCandidate || parsedCandidate.level !== group.level) continue;
+          if (!group.parentNumbers.every((value, idx) => parsedCandidate.numbers[idx] === value)) continue;
+
+          siblingParents.push(candidate);
+          scoreByParentId.set(candidate.id, group.bestScore);
+        }
+      }
+
+      if (siblingParents.length > 0) {
+        const parentsByGroup = new Map<string, ParentChunkRow[]>();
+        const groupOrder: string[] = [];
+
+        const appendParent = (parent: ParentChunkRow) => {
+          const key = `${parent.document_id}|||${getN1Header(parent)}`;
+          if (!parentsByGroup.has(key)) {
+            parentsByGroup.set(key, []);
+            groupOrder.push(key);
+          }
+          const groupRows = parentsByGroup.get(key)!;
+          if (!groupRows.some((row) => row.id === parent.id)) {
+            groupRows.push(parent);
+          }
+        };
+
+        orderedParentRows.forEach(appendParent);
+        siblingParents.forEach(appendParent);
+
+        orderedParentRows = groupOrder.flatMap((key) =>
+          sortParentsByStructuralOrder(parentsByGroup.get(key)!),
+        );
+      }
+    }
+
+    const clusters = buildClusters(orderedParentRows, scoreByParentId);
+    const boostedClusters = applyHierarchicalBoost(clusters);
+    const boostedParents = flattenClusters(boostedClusters);
+    const parentsToUse = boostedParents.length ? boostedParents : orderedParentRows;
 
     // [TRACE 5] Ordem retornada pelo Prisma
     console.log('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
@@ -326,7 +611,7 @@ export class RagService implements OnModuleInit {
       if (pid && !triggeringChildByParentId.has(pid)) triggeringChildByParentId.set(pid, child);
     }
 
-    const parents = orderedParentRows.map((row) => {
+    const parents = parentsToUse.map((row) => {
       const triggeringChild = triggeringChildByParentId.get(row.id);
       let pageContent = row.content;
 
@@ -365,94 +650,13 @@ export class RagService implements OnModuleInit {
     return { parents, sourceDocIds: Array.from(sourceDocIds) };
   }
 
-  private buildPrompt(contexts: Document[], userQuery: string): string {
-    const contextBlock = contexts
-      .map((doc, i) => {
-        const section = doc.metadata.sectionHeader as string;
-        const n2      = doc.metadata.n2_header     as string;
-        const label   = n2 && n2 !== section ? `${section} — ${n2}` : section;
-        return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
-      })
-      .join('\n\n---\n\n');
-
-    return `Voce e um assistente especializado em documentos normativos e administrativos.
-
-Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
-
-REGRAS OBRIGATORIAS:
-
-1. FONTE PRINCIPAL
-   Use o Documento Ref 1 como fonte primaria.
-   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
-   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
-
-2. FIDELIDADE AO TEXTO
-   Preserve a redacao original do documento.
-   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
-   A fidelidade ao texto tem prioridade sobre reformulacoes estilisticas.
-
-3. PRESERVACAO DE LISTAS
-   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
-   - reproduza todos os itens sem excecao;
-   - mantenha exatamente a ordem original;
-   - nao reorganize, nao agrupe e nao omita nenhum item;
-   - nao crie novos itens.
-   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
-
-4. NAO TRUNCAR CONTEUDO
-   Nunca interrompa frases, dispositivos legais ou referencias normativas.
-   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
-   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
-
-5. FORMATO DA RESPOSTA
-   Utilize preferencialmente:
-   - Uma frase de introducao curta.
-   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
-   Evite blocos longos de texto corrido.
-
-6. CITACAO OBRIGATORIA
-   Ao final da resposta, informe a referencia de forma especifica:
-
-   Fonte:
-   - Documento Ref X — Item X.X (titulo do item, se houver)
-
-   Se mais de um documento foi utilizado:
-   Fonte:
-   - Documento Ref 1 — Item X.X (titulo)
-   - Documento Ref 3 — Item Y.Y (titulo)
-
-   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
-
-7. PROIBICOES
-   Nao inclua:
-   - interpretacoes juridicas;
-   - comentarios ou observacoes extras;
-   - exemplos nao presentes no documento;
-   - recomendacoes;
-   - contexto historico;
-   - explicacoes adicionais nao solicitadas.
-   Responda apenas ao que foi perguntado.
-
-8. AUSENCIA DE INFORMACAO
-   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
-   "As informacoes disponiveis nao sao suficientes."
-
---- INICIO DOS DOCUMENTOS DE REFERENCIA ---
-${contextBlock}
---- FIM DOS DOCUMENTOS DE REFERENCIA ---
-
-Pergunta: ${userQuery}
-
-Resposta:`;
-  }
-
   async query(
     userQuery: string,
     conversationId: string,
   ): Promise<{ id: string; created_at: Date; response: string; sources: { id: string; title: string }[] }> {
     const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery, 5);
 
-    const prompt = this.buildPrompt(parents, userQuery);
+    const prompt = buildRagPrompt(parents, userQuery);
 
     let aiResponse = '';
     try {
