@@ -7,7 +7,6 @@ import { ConfigModule } from '@nestjs/config';
 import { UsersModule } from './users/users.module';
 import { DocumentsModule } from './documents/documents.module';
 import { ChatModule } from './chat/chat.module';
-import { RagService } from './rag/rag.service';
 
 @Module({
   imports: [
@@ -22,6 +21,10 @@ import { RagService } from './rag/rag.service';
     ChatModule
   ],
   controllers: [AppController],
-  providers: [AppService, RagService],
+  // RagService NAO e declarado aqui: ele e provido (e exportado) pelo
+  // RagModule, que e @Global. Declara-lo tambem neste modulo criava uma
+  // SEGUNDA instancia do servico — com um segundo pool de conexoes PG e uma
+  // segunda inicializacao do PGVectorStore a cada boot.
+  providers: [AppService],
 })
 export class AppModule {}

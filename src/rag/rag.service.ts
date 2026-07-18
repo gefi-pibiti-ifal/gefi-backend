@@ -1,6 +1,11 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { splitLegalDocument, parseItemNumber } from './legal-document-splitter';
+import {
+  splitLegalDocument,
+  parseItemNumber,
+  splitIntoChildChunks,
+  CHILD_CHUNK_SIZE,
+} from './legal-document-splitter';
 import {
   buildClusters,
   applyHierarchicalBoost,
@@ -36,14 +41,32 @@ const EMBEDDING_BATCH_DELAY = 10_000; // ms entre lotes
 const EMBEDDING_RETRY_DELAY = 65_000; // ms após rate-limit 429
 const EMBEDDING_MAX_RETRIES = 5;
 
+// Retrieval
+// Quantos child chunks buscar no indice vetorial. Childs do mesmo parent
+// colapsam na deduplicacao (com k=5 sobravam 2-3 parents efetivos); os tetos
+// MAX_EXPANDED_PARENTS / MAX_EXPANDED_CHARS continuam limitando o que chega
+// ao prompt.
+const RETRIEVAL_FETCH_K = 12;
+// Teto de irmaos adicionados por grupo na expansao hierarquica — apenas os
+// numericamente mais proximos dos itens recuperados. Sem teto, um item com
+// muitos irmaos inunda o orcamento de contexto e expulsa parents relevantes
+// de outros grupos.
+const MAX_SIBLINGS_PER_GROUP = 3;
+
 // Filtro de qualidade dos ParentChunks
 const MIN_PARENT_CONTENT_LENGTH = 80;
 
-// Janela deslizante
-const SLIDING_WINDOW_BEFORE        = 400;
-const SLIDING_WINDOW_AFTER         = 800;
+// Janela deslizante — aplicada SOMENTE a parents maiores que o limiar abaixo.
+// Parents menores entram integros no prompt: truncar justamente o trecho mais
+// relevante (o parent que disparou o hit) era uma das principais causas de
+// respostas incompletas/resumidas.
+const SLIDING_WINDOW_MIN_PARENT_LENGTH = 3500;
+const SLIDING_WINDOW_BEFORE            = 1200;
+const SLIDING_WINDOW_AFTER             = 2400;
 // Tamanhos do anchor tentados em ordem decrescente (fallback progressivo)
 const SLIDING_WINDOW_ANCHOR_SIZES  = [50, 40, 30, 20] as const;
+// Alcance maximo da busca por fronteira de sentenca ao ajustar a janela
+const SENTENCE_SNAP_RANGE = 300;
 
 // ---------------------------------------------------------------------------
 // Helpers de throttling
@@ -139,11 +162,113 @@ export function normalizeForSearch(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+// Log de TRACE condicionado a DEBUG_RAG — evita custo/ruido de console.log
+// em producao (os TRACEs incluem dumps de embedding e do contexto completo).
+function trace(...args: unknown[]): void {
+  if (DEBUG_RAG) console.log(...args);
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ---------------------------------------------------------------------------
+// findAnchorIndex
+//
+// Localiza o inicio do child chunk dentro do conteudo do parent.
+// Tolerante a diferencas de whitespace (espaco vs quebra de linha — artefato
+// comum de extracao de PDF): o anchor vira uma regex em que qualquer
+// sequencia de whitespace casa com \s+.
+// Tenta anchors progressivamente menores (SLIDING_WINDOW_ANCHOR_SIZES) ate
+// encontrar. Retorna -1 se nenhum tamanho casar.
+// ---------------------------------------------------------------------------
+export function findAnchorIndex(parentContent: string, childContent: string): number {
+  for (const size of SLIDING_WINDOW_ANCHOR_SIZES) {
+    const anchor = childContent.slice(0, size).trim();
+    if (anchor.length < 10) continue;
+    const pattern = new RegExp(escapeRegExp(anchor).replace(/\s+/g, '\\s+'));
+    const match   = pattern.exec(parentContent);
+    if (match) return match.index;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// snapWindowStart / snapWindowEnd
+//
+// Ajustam as bordas da janela deslizante para fronteiras de sentenca ou de
+// linha, evitando cortar dispositivos no meio de uma frase. A busca e
+// limitada a SENTENCE_SNAP_RANGE chars; sem fronteira nesse alcance, a borda
+// original e mantida (o marcador [...] sinaliza o corte).
+// ---------------------------------------------------------------------------
+export function snapWindowStart(content: string, start: number): number {
+  if (start <= 0) return start;
+  const from    = Math.max(0, start - SENTENCE_SNAP_RANGE);
+  const region  = content.slice(from, start);
+  const breakAt = Math.max(region.lastIndexOf('\n'), region.lastIndexOf('. '));
+  if (breakAt === -1) return start;
+  const isSentence = region.slice(breakAt, breakAt + 2) === '. ';
+  return from + breakAt + (isSentence ? 2 : 1);
+}
+
+export function snapWindowEnd(content: string, end: number): number {
+  if (end >= content.length) return end;
+  const region = content.slice(end, Math.min(content.length, end + SENTENCE_SNAP_RANGE));
+  const nl     = region.indexOf('\n');
+  const dot    = region.indexOf('. ');
+  const stops: number[] = [];
+  if (nl  !== -1) stops.push(nl);           // fim de linha: nao inclui o \n
+  if (dot !== -1) stops.push(dot + 1);      // fim de sentenca: inclui o ponto
+  if (stops.length === 0) return end;
+  return end + Math.min(...stops);
+}
+
 // ---------------------------------------------------------------------------
 // Limpeza pre-chunking
 // ---------------------------------------------------------------------------
+
+// Ligaturas tipograficas comuns em fontes de PDF -> forma expandida.
+// Mapeamento 1:1 sem ambiguidade ("ﬁscalizacao" -> "fiscalizacao").
+const PDF_LIGATURES: Array<[RegExp, string]> = [
+  [/ﬀ/g, 'ff'],
+  [/ﬁ/g, 'fi'],
+  [/ﬂ/g, 'fl'],
+  [/ﬃ/g, 'ffi'],
+  [/ﬄ/g, 'ffl'],
+];
+
+// Remove artefatos invisiveis de extracao de PDF. Operacoes 100% seguras:
+// soft hyphen (U+00AD) e zero-width (U+200B..D, U+FEFF) nao tem representacao
+// visual; NBSP (U+00A0) e visualmente identico ao espaco comum. Nada de
+// conteudo e alterado — apenas a codificacao e normalizada.
+export function stripInvisibleArtifacts(text: string): string {
+  let out = text
+    .replace(/[\u00AD\u200B\u200C\u200D\uFEFF]/g, '')
+    .replace(/\u00A0/g, ' ');
+  for (const [re, expanded] of PDF_LIGATURES) out = out.replace(re, expanded);
+  return out;
+}
+
+// De-hifenizacao ATESTADA pelo proprio documento: une "fiscali-\nzacao" ->
+// "fiscalizacao" SOMENTE se a palavra unida ocorre integra em algum outro
+// ponto do texto. Sem atestado, o trecho fica exatamente como estava — nada
+// e inventado. Compostos legitimos quebrados no proprio hifen ("decreto-\nlei")
+// nao sao unidos, pois "decretolei" nao ocorre no documento.
+export function dehyphenateAttested(text: string): string {
+  const words = new Set<string>();
+  for (const token of text.split(/[^\p{L}]+/u)) {
+    if (token.length >= 4) words.add(token.toLowerCase());
+  }
+  return text.replace(
+    /(\p{L}{2,})-\n(\p{Ll}{2,})/gu,
+    (match, a: string, b: string) =>
+      words.has(`${a}${b}`.toLowerCase()) ? `${a}${b}` : match,
+  );
+}
+
 function cleanExtractedText(raw: string): string {
-  return raw
+  const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw));
+  return preprocessed
     .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
     .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
     .replace(/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s\/\-\.]{5,80}$/gm, (match) => {
@@ -188,88 +313,85 @@ function resolveFinishReason(response: any): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// buildSourceLabel
+//
+// Monta o cabecalho estrutural de cada fonte no prompt a partir dos metadados
+// que ja chegam no Document (title, n1_header, n2_header, sectionHeader).
+// Ex: [Fonte 1] Documento: "Edital X" | ANEXO VIII-B | Item 10.2.
+//
+// "Fonte N" e apenas o identificador posicional do bloco dentro do prompt;
+// o modelo e instruido a citar SEMPRE pela referencia estrutural (documento,
+// anexo, item), que e estavel e rastreavel fora desta requisicao.
+// ---------------------------------------------------------------------------
+export function buildSourceLabel(doc: Document, index: number): string {
+  const md      = doc.metadata as Record<string, unknown>;
+  const title   = typeof md.title === 'string' && md.title ? md.title : 'Documento sem titulo';
+  const n1      = typeof md.n1_header === 'string' ? md.n1_header : '';
+  const n2      = typeof md.n2_header === 'string' ? md.n2_header : '';
+  const section = typeof md.sectionHeader === 'string' ? md.sectionHeader : '';
+
+  const parts: string[] = [`Documento: "${title}"`];
+  if (n1) parts.push(n1);
+
+  // n2 e o item ("10.2.") ou artigo ("Art. 39"); sem n2, usa sectionHeader
+  // quando ele nao repete o n1.
+  const item = n2 || (section !== n1 ? section : '');
+  if (item) parts.push(/^art/i.test(item) ? item : `Item ${item}`);
+
+  // A prioridade definida no retrieval (metadado role PRINCIPAL/COMPLEMENTAR)
+  // NAO e renderizada no rotulo: a ordem dos trechos ja carrega o sinal (o
+  // primeiro e o mais pertinente) e vocabulario interno do pipeline nao deve
+  // induzir a resposta a falar em "fontes principais/complementares".
+  return `[Trecho ${index + 1}] ${parts.join(' | ')}`;
+}
+
 export function buildRagPrompt(contexts: Document[], userQuery: string): string {
   const contextBlock = contexts
-    .map((doc, i) => {
-      const section = doc.metadata.sectionHeader as string;
-      const n2      = doc.metadata.n2_header     as string;
-      const label   = n2 && n2 !== section ? `${section} — ${n2}` : section;
-      return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
-    })
+    .map((doc, i) => `${buildSourceLabel(doc, i)}\n${doc.pageContent}`)
     .join('\n\n---\n\n');
 
-  return `Voce e um assistente especializado em documentos normativos e administrativos.
+  return `Voce e um assistente especializado em normas e documentos administrativos brasileiros. Quem pergunta e um servidor publico que precisa de uma resposta clara, correta e util para aplicar a norma no dia a dia.
 
-Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
+Abaixo estao trechos de documentos normativos, cada um com uma anotacao interna de origem (documento, anexo, item). Os trechos estao ordenados por pertinencia — o primeiro e o mais diretamente relacionado a pergunta. As anotacoes, os rotulos [Trecho N] e o mecanismo de selecao de trechos sao detalhes internos do sistema e nao fazem parte da resposta.
 
-REGRAS OBRIGATORIAS:
+COMO RESPONDER:
 
-1. FONTE PRINCIPAL
-   Use o Documento Ref 1 como fonte primaria.
-   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
-   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
+1. RESPONDA A PERGUNTA, NAO DESCREVA O SISTEMA
+   Comece respondendo diretamente o que foi perguntado, em linguagem natural, como um especialista que conhece a norma.
+   Nunca abra a resposta comentando os documentos ou trechos ("Foram recuperados...", "Os dispositivos encontrados...", "O contexto contem...").
+   Nunca use na resposta termos internos como "Fonte 1", "Trecho 2", "documento principal", "documento complementar", "contexto recuperado".
 
-2. FIDELIDADE AO TEXTO
-   Preserve a redacao original do documento.
-   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
-   A fidelidade ao texto tem prioridade sobre reformulacoes stilisticas.
+2. ESCOLHA O MODO PELO TIPO DE PERGUNTA
+   a) Pergunta explicativa ("quais sao...", "como funciona...", "o que deve...", "quando..."):
+      - responda de forma direta e organizada, sintetizando com fidelidade o que a norma determina;
+      - use topicos quando facilitarem a leitura;
+      - preserve com exatidao numeros, prazos, valores, percentuais, obrigacoes e a numeracao dos dispositivos, citando-a de forma natural no texto (ex: "conforme o item 10.2.1 do Anexo VIII-B");
+      - transcreva literalmente apenas passagens curtas em que a redacao exata importa;
+      - nao copie secoes inteiras da norma quando uma sintese fiel responde a pergunta.
+   b) Pedido de transcricao ("transcreva...", "copie...", "reproduza...", "mostre na integra...", "texto exato..."):
+      - reproduza o texto literalmente, completo e na ordem original;
+      - mantenha a numeracao e a estrutura originais (itens, subitens, alineas, incisos);
+      - nao resuma, nao reorganize, nao omita e nao acrescente nada.
 
-3. PRESERVACAO DE LISTAS
-   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
-   - reproduza todos os itens sem excecao;
-   - mantenha exatamente a ordem original;
-   - nao reorganize, nao agrupe e nao omita nenhum item;
-   - nao crie novos itens.
-   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
-
-4. NAO TRUNCAR CONTEUDO
-   Nunca interrompa frases, dispositivos legais ou referencias normativas.
-   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
-   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
-
-5. FORMATO DA RESPOSTA
-   Utilize preferencialmente:
-   - Uma frase de introducao curta.
-   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
-   Evite blocos longos de texto corrido.
-
-6. CITACAO OBRIGATORIA
-   Ao final da resposta, informe a referencia de forma especifica:
-
-   Fonte:
-   - Documento Ref X — Item X.X (titulo do item, se houver)
-
-   Se mais de um documento foi utilizado:
-   Fonte:
-   - Documento Ref 1 — Item X.X (titulo)
-   - Documento Ref 3 — Item Y.Y (titulo)
-
-   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
-
-7. PROIBICOES
-   Nao inclua:
-   - interpretacoes juridicas;
-   - comentarios ou observacoes extras;
-   - exemplos nao presentes no documento;
-   - recomendacoes;
-   - contexto historico;
-   - explicacoes adicionais nao solicitadas.
-   Responda apenas ao que foi perguntado.
-
-8. AUSENCIA DE INFORMACAO
-   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
+3. FIDELIDADE AO TEXTO NORMATIVO
+   Use somente o conteudo dos trechos fornecidos; nao use conhecimento externo.
+   Nao invente dispositivos, numeros ou continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
+   Nao faca interpretacao juridica, recomendacao ou opiniao alem do que a norma diz.
+   Se os trechos nao contiverem a informacao perguntada, responda EXATAMENTE:
    "As informacoes disponiveis nao sao suficientes."
 
-9. SINTESE DE CONTEXTO RELACIONADO
-   Se os documentos recuperados pertencerem ao mesmo contexto estrutural ou n1_header,
-   sintetize as informacoes complementares.
-   preserve a origem de cada informacao indicando o item correspondente.
-   Nao repita conteudos identicos.
-   Nao ignore documentos relacionados recuperados.
+4. FONTES AO FINAL
+   Encerre a resposta com um bloco de referencias, uma por linha:
 
---- INICIO DOS DOCUMENTOS DE REFERENCIA ---
+   Fontes:
+   - <titulo do documento> — <anexo ou capitulo, se houver> — <item ou artigo>
+
+   Liste apenas os dispositivos efetivamente usados na resposta. Nao numere as fontes nem use rotulos internos.
+
+--- TRECHOS DOS DOCUMENTOS (uso interno) ---
 ${contextBlock}
---- FIM DOS DOCUMENTOS DE REFERENCIA ---
+--- FIM DOS TRECHOS ---
 
 Pergunta: ${userQuery}
 
@@ -298,7 +420,13 @@ export class RagService implements OnModuleInit {
     this.llm = new ChatGoogleGenerativeAI({
       apiKey,
       model: 'gemini-2.5-flash',
-      temperature: 0.4,
+      // Reproducao literal de texto normativo pede decodificacao conservadora:
+      // temperatura alta amplia parafrase e reorganizacao de listas.
+      temperature: 0.1,
+      // Teto de saida explicito: a transcricao integral de dois ou mais itens
+      // longos nao pode ser cortada pelo limite default — corte no meio da
+      // lista forca o modelo a "fechar resumindo".
+      maxOutputTokens: 8192,
       safetySettings: [
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -335,10 +463,6 @@ export class RagService implements OnModuleInit {
     const cleanedText = cleanExtractedText(rawContent);
     const chunks = splitLegalDocument(cleanedText);
 
-    const BATCH_SIZE  = 15;
-    const BATCH_DELAY = 10000;
-    const RETRY_DELAY = 65000;
-
     let totalChildren = 0;
 
     type GroupEntry = {
@@ -346,7 +470,6 @@ export class RagService implements OnModuleInit {
       n2_header: string;
       sectionHeader: string;
       contentParts: string[];
-      childContents: string[];
     };
 
     const groupMap = new Map<string, GroupEntry>();
@@ -361,18 +484,19 @@ export class RagService implements OnModuleInit {
           n2_header,
           sectionHeader: (n2_header || n1_header || 'Secao').slice(0, 255),
           contentParts: [],
-          childContents: [],
         });
       }
 
-      const entry = groupMap.get(key)!;
-      entry.contentParts.push(chunk.content);
-      entry.childContents.push(chunk.content);
+      groupMap.get(key)!.contentParts.push(chunk.content);
     }
 
     const allChildDocs: Document[] = [];
 
     for (const entry of groupMap.values()) {
+      // O splitter emite o texto integro de cada grupo estrutural; o parent
+      // persiste esse texto sem alteracao. Os children sao derivados DEPOIS,
+      // como janelas sobre o conteudo final do parent — assim todo child e
+      // substring exata do parent e o parent nunca contem texto duplicado.
       const fullContent = entry.contentParts.join('\n');
 
       const savedParent = await this.prisma.parentChunk.create({
@@ -389,7 +513,12 @@ export class RagService implements OnModuleInit {
         },
       });
 
-      for (const childContent of entry.childContents) {
+      const childContents =
+        fullContent.length > CHILD_CHUNK_SIZE
+          ? splitIntoChildChunks(fullContent)
+          : [fullContent];
+
+      for (const childContent of childContents) {
         allChildDocs.push(
           new Document({
             pageContent: childContent,
@@ -405,14 +534,14 @@ export class RagService implements OnModuleInit {
       }
     }
 
-    const batches = chunkArray(allChildDocs, BATCH_SIZE);
+    const batches = chunkArray(allChildDocs, EMBEDDING_BATCH_SIZE);
 
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
       this.logger.log(`[RAG] Vetorizando lote ${i + 1}/${batches.length} (${batch.length} chunks)...`);
 
       let attempt = 0;
-      while (attempt < 5) {
+      while (attempt < EMBEDDING_MAX_RETRIES) {
         try {
           await this.vectorStore.addDocuments(batch);
           totalChildren += batch.length;
@@ -423,9 +552,9 @@ export class RagService implements OnModuleInit {
             String(err?.message).includes('429') ||
             String(err?.message).toLowerCase().includes('quota');
 
-          if (is429 && attempt < 4) {
-            this.logger.warn(`[RAG] Rate limit (429) no lote ${i + 1}. Aguardando ${RETRY_DELAY / 1000}s...`);
-            await delay(RETRY_DELAY);
+          if (is429 && attempt < EMBEDDING_MAX_RETRIES - 1) {
+            this.logger.warn(`[RAG] Rate limit (429) no lote ${i + 1}. Aguardando ${EMBEDDING_RETRY_DELAY / 1000}s...`);
+            await delay(EMBEDDING_RETRY_DELAY);
             attempt++;
           } else {
             throw err;
@@ -433,7 +562,7 @@ export class RagService implements OnModuleInit {
         }
       }
 
-      if (i < batches.length - 1) await delay(BATCH_DELAY);
+      if (i < batches.length - 1) await delay(EMBEDDING_BATCH_DELAY);
     }
 
     this.logger.log(
@@ -443,12 +572,12 @@ export class RagService implements OnModuleInit {
     return { success: true, documentId, sections: groupMap.size, childChunks: totalChildren };
   }
 
-  private async retrieveParentContexts(userQuery: string, k = 5) {
+  private async retrieveParentContexts(userQuery: string, k = RETRIEVAL_FETCH_K) {
     const queryVec = await this.embeddings.embedQuery(userQuery);
 
     // [TRACE 1] Query e embedding
-    console.log('\n[TRACE 1] userQuery:', userQuery);
-    console.log(`[TRACE 1] embedding: dim=${queryVec.length} | primeiros valores=[${queryVec.slice(0, 5).map(v => v.toFixed(6)).join(', ')}]`);
+    trace('\n[TRACE 1] userQuery:', userQuery);
+    trace(`[TRACE 1] embedding: dim=${queryVec.length} | primeiros valores=[${queryVec.slice(0, 5).map(v => v.toFixed(6)).join(', ')}]`);
 
     let filter: any = undefined;
     const anexoMatch = userQuery.match(/(?:Anexo)\s+([IVXLCDM]+(?:-[A-Z])?)/i);
@@ -457,40 +586,57 @@ export class RagService implements OnModuleInit {
     }
 
     // [TRACE 2] Filtro final enviado para a busca vetorial
-    console.log('[TRACE 2] filter enviado para similaritySearchVectorWithScore:', JSON.stringify(filter ?? null));
+    trace('[TRACE 2] filter enviado para similaritySearchVectorWithScore:', JSON.stringify(filter ?? null));
 
-    const childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k, filter);
+    let childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k, filter);
+
+    // Fallback de recall: o filtro de Anexo usa igualdade exata sobre
+    // n1_header — "ANEXO VIII" nao casa com "ANEXO VIII-B". Se a busca
+    // filtrada nao retornar nada, refaz sem filtro em vez de terminar em
+    // "informacoes insuficientes" por um detalhe de grafia.
+    if (filter && childResults.length === 0) {
+      trace('[TRACE 2b] Busca filtrada sem resultados — refazendo sem filtro');
+      childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k);
+    }
 
     // [TRACE 3] Child chunks retornados pela busca vetorial
-    console.log(`\n[TRACE 3] ${childResults.length} child chunk(s) retornados:`);
-    childResults.forEach(([child, score], i) => {
-      console.log(
-        `  [${i + 1}] score=${score.toFixed(6)}` +
-        ` | n1="${child.metadata.n1_header ?? ''}"` +
-        ` | n2="${child.metadata.n2_header ?? ''}"` +
-        ` | parentId=${child.metadata.parentId}` +
-        ` | preview="${child.pageContent.slice(0, 120).replace(/\n/g, ' ')}"`
-      );
-    });
+    if (DEBUG_RAG) {
+      trace(`\n[TRACE 3] ${childResults.length} child chunk(s) retornados:`);
+      childResults.forEach(([child, score], i) => {
+        trace(
+          `  [${i + 1}] score=${score.toFixed(6)}` +
+          ` | n1="${child.metadata.n1_header ?? ''}"` +
+          ` | n2="${child.metadata.n2_header ?? ''}"` +
+          ` | parentId=${child.metadata.parentId}` +
+          ` | preview="${child.pageContent.slice(0, 120).replace(/\n/g, ' ')}"`
+        );
+      });
+    }
 
     const parentIds       = new Set<string>();
     const orderedParentIds: string[] = [];
-    const sourceDocIds    = new Set<string>();
     const scoreByParentId = new Map<string, number>();
     for (const [child, score] of childResults) {
       const parentId = child.metadata.parentId as string | undefined;
-      const docId    = child.metadata.documentId as string | undefined;
       if (parentId && !parentIds.has(parentId)) {
         parentIds.add(parentId);
         orderedParentIds.push(parentId);
       }
-      if (docId) sourceDocIds.add(docId);
-      if (parentId) scoreByParentId.set(parentId, score);
+      // Guarda o MELHOR score (menor distancia) entre os childs do parent.
+      // Antes cada child sobrescrevia o anterior e o parent terminava com o
+      // score do PIOR child recuperado — invertendo prioridades no boost
+      // hierarquico e na heranca de score da expansao de irmaos.
+      if (parentId) {
+        const prev = scoreByParentId.get(parentId);
+        if (prev === undefined || score < prev) scoreByParentId.set(parentId, score);
+      }
     }
 
     // [TRACE 4] Ordem de insercao dos parentIds no Set
-    console.log('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
-    orderedParentIds.forEach((pid, i) => console.log(`  ${i + 1} -> ${pid}`));
+    if (DEBUG_RAG) {
+      trace('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
+      orderedParentIds.forEach((pid, i) => trace(`  ${i + 1} -> ${pid}`));
+    }
 
     const parentRows = await this.prisma.parentChunk.findMany({
       where: { id: { in: orderedParentIds } },
@@ -509,12 +655,20 @@ export class RagService implements OnModuleInit {
       level: number;
       bestScore: number;
       retrievedIds: Set<string>;
+      // Ultimo componente numerico dos itens recuperados do grupo
+      // (ex: 10.2. -> 2). Usado para expandir apenas os irmaos mais
+      // proximos numericamente dos itens que o retriever de fato encontrou.
+      retrievedLastNumbers: number[];
     }>();
 
     for (const row of orderedParentRows) {
       const n2Header = getN2Header(row);
       const prefixInfo = deriveSiblingPrefix(n2Header);
       if (!prefixInfo) continue;
+
+      // deriveSiblingPrefix != null garante parse valido de n2Header
+      const parsedN2   = parseItemNumber(n2Header)!;
+      const lastNumber = parsedN2.numbers[parsedN2.numbers.length - 1];
 
       const groupKey = `${row.document_id}|||${getN1Header(row)}|||${prefixInfo.parentPrefix}|||${prefixInfo.level}`;
       const score = scoreByParentId.get(row.id) ?? Infinity;
@@ -529,10 +683,12 @@ export class RagService implements OnModuleInit {
           level: prefixInfo.level,
           bestScore: score,
           retrievedIds: new Set([row.id]),
+          retrievedLastNumbers: [lastNumber],
         });
       } else {
         existingGroup.retrievedIds.add(row.id);
         existingGroup.bestScore = Math.min(existingGroup.bestScore, score);
+        existingGroup.retrievedLastNumbers.push(lastNumber);
       }
     }
 
@@ -548,6 +704,8 @@ export class RagService implements OnModuleInit {
           },
         });
 
+        const validCandidates: Array<{ row: ParentChunkRow; distance: number }> = [];
+
         for (const candidate of candidates) {
           if (group.retrievedIds.has(candidate.id)) continue;
           if (candidate.content.length < MIN_PARENT_CONTENT_LENGTH) continue;
@@ -557,8 +715,21 @@ export class RagService implements OnModuleInit {
           if (!parsedCandidate || parsedCandidate.level !== group.level) continue;
           if (!group.parentNumbers.every((value, idx) => parsedCandidate.numbers[idx] === value)) continue;
 
-          siblingParents.push(candidate);
-          scoreByParentId.set(candidate.id, group.bestScore);
+          const candidateLast = parsedCandidate.numbers[parsedCandidate.numbers.length - 1];
+          const distance = Math.min(
+            ...group.retrievedLastNumbers.map((n) => Math.abs(candidateLast - n)),
+          );
+          validCandidates.push({ row: candidate, distance });
+        }
+
+        // Teto de expansao: apenas os MAX_SIBLINGS_PER_GROUP irmaos mais
+        // proximos numericamente dos itens recuperados (10.2 -> 10.1 e 10.3
+        // antes de 10.9). Irmaos distantes raramente completam a resposta e
+        // consomem o orcamento de contexto de parents relevantes.
+        validCandidates.sort((a, b) => a.distance - b.distance);
+        for (const { row } of validCandidates.slice(0, MAX_SIBLINGS_PER_GROUP)) {
+          siblingParents.push(row);
+          scoreByParentId.set(row.id, group.bestScore);
         }
       }
 
@@ -592,18 +763,45 @@ export class RagService implements OnModuleInit {
     const boostedParents = flattenClusters(boostedClusters);
     const parentsToUse = boostedParents.length ? boostedParents : orderedParentRows;
 
-    // [TRACE 5] Ordem retornada pelo Prisma
-    console.log('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
-    parentRows.forEach((row, i) =>
-      console.log(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`)
-    );
-    const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
-    console.log(`[TRACE 5] O Prisma preservou a ordem dos parentIds? ${prismaPreservedOrder ? 'SIM' : 'NAO'}`);
-    console.log('  (esperado):', orderedParentIds.join(' -> '));
-    console.log('  (recebido):', parentRows.map(r => r.id).join(' -> '));
+    // -----------------------------------------------------------------------
+    // Fonte PRINCIPAL vs COMPLEMENTAR
+    //
+    // PRINCIPAL = o parent RECUPERADO pelo retriever (nao um irmao expandido)
+    // com o melhor score vetorial, dentre os que sobreviveram aos filtros e
+    // tetos. Ele vai sempre na frente do prompt e recebe marcacao explicita;
+    // os demais entram como apoio, para que nao concorram com ele em peso.
+    // Se nenhum parent recuperado sobreviveu (caso raro), nenhuma marcacao e
+    // aplicada e o prompt cai na selecao por pertinencia de conteudo.
+    // -----------------------------------------------------------------------
+    const retrievedIdSet = new Set(orderedParentIds);
+    let primaryId: string | null = null;
+    let primaryBestScore = Infinity;
+    for (const row of parentsToUse) {
+      if (!retrievedIdSet.has(row.id)) continue;
+      const score = scoreByParentId.get(row.id) ?? Infinity;
+      if (score < primaryBestScore) {
+        primaryBestScore = score;
+        primaryId = row.id;
+      }
+    }
+    const orderedForPrompt = primaryId
+      ? [
+          ...parentsToUse.filter((row) => row.id === primaryId),
+          ...parentsToUse.filter((row) => row.id !== primaryId),
+        ]
+      : parentsToUse;
 
-    const MARGEM_ANTES  = 400;
-    const MARGEM_DEPOIS = 800;
+    // [TRACE 5] Ordem retornada pelo Prisma
+    if (DEBUG_RAG) {
+      trace('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
+      parentRows.forEach((row, i) =>
+        trace(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`)
+      );
+      const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
+      trace(`[TRACE 5] O Prisma preservou a ordem dos parentIds? ${prismaPreservedOrder ? 'SIM' : 'NAO'}`);
+      trace('  (esperado):', orderedParentIds.join(' -> '));
+      trace('  (recebido):', parentRows.map(r => r.id).join(' -> '));
+    }
 
     const triggeringChildByParentId = new Map<string, Document>();
     for (const [child] of childResults) {
@@ -611,16 +809,26 @@ export class RagService implements OnModuleInit {
       if (pid && !triggeringChildByParentId.has(pid)) triggeringChildByParentId.set(pid, child);
     }
 
-    const parents = parentsToUse.map((row) => {
+    const parents = orderedForPrompt.map((row) => {
       const triggeringChild = triggeringChildByParentId.get(row.id);
       let pageContent = row.content;
 
-      if (triggeringChild) {
-        const anchor     = triggeringChild.pageContent.slice(0, 50).trim();
-        const startIndex = row.content.indexOf(anchor);
+      // Janela deslizante apenas para parents grandes demais para o prompt.
+      // Parents ate SLIDING_WINDOW_MIN_PARENT_LENGTH entram INTEGROS — o
+      // parent que disparou o hit e o trecho mais relevante e nao deve ser
+      // truncado. Nos grandes, a janela e centrada no child que casou, com
+      // anchor progressivo tolerante a whitespace e bordas ajustadas para
+      // fronteiras de sentenca.
+      if (triggeringChild && row.content.length > SLIDING_WINDOW_MIN_PARENT_LENGTH) {
+        const startIndex = findAnchorIndex(row.content, triggeringChild.pageContent);
         if (startIndex !== -1) {
-          const windowStart = Math.max(0, startIndex - MARGEM_ANTES);
-          const windowEnd   = Math.min(row.content.length, startIndex + triggeringChild.pageContent.length + MARGEM_DEPOIS);
+          let windowStart = Math.max(0, startIndex - SLIDING_WINDOW_BEFORE);
+          let windowEnd   = Math.min(
+            row.content.length,
+            startIndex + triggeringChild.pageContent.length + SLIDING_WINDOW_AFTER,
+          );
+          windowStart = snapWindowStart(row.content, windowStart);
+          windowEnd   = snapWindowEnd(row.content, windowEnd);
           const slice  = row.content.substring(windowStart, windowEnd);
           const prefix = windowStart > 0                  ? '[...] ' : '';
           const suffix = windowEnd   < row.content.length ? ' [...]' : '';
@@ -637,28 +845,45 @@ export class RagService implements OnModuleInit {
           n2_header:     (row.metadata as any)?.n2_header ?? '',
           sectionHeader: row.section_header,
           parentId:      row.id,
+          ...(primaryId
+            ? { role: row.id === primaryId ? 'PRINCIPAL' : 'COMPLEMENTAR' }
+            : {}),
         },
       });
     });
 
     // [TRACE 6] Ordem final dos ParentChunks enviados ao LLM
-    console.log('\n[TRACE 6] Ordem final dos ParentChunks enviados ao LLM:');
-    parents.forEach((doc, i) =>
-      console.log(`  [Documento Ref ${i + 1}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`)
+    if (DEBUG_RAG) {
+      trace('\n[TRACE 6] Ordem final dos ParentChunks enviados ao LLM:');
+      parents.forEach((doc, i) =>
+        trace(`  [Fonte ${i + 1}${doc.metadata.role ? ` — ${doc.metadata.role}` : ''}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`)
+      );
+    }
+
+    // Fontes persistidas = documentos cujo conteudo realmente entrou no
+    // prompt. Antes vinham dos child hits, incluindo documentos cujos
+    // parents foram filtrados ou cortados pelos tetos — citacao sem uso.
+    const sourceDocIds = Array.from(
+      new Set(
+        parents
+          .map((doc) => doc.metadata.documentId as string | undefined)
+          .filter((id): id is string => Boolean(id)),
+      ),
     );
 
-    return { parents, sourceDocIds: Array.from(sourceDocIds) };
+    return { parents, sourceDocIds };
   }
 
   async query(
     userQuery: string,
     conversationId: string,
   ): Promise<{ id: string; created_at: Date; response: string; sources: { id: string; title: string }[] }> {
-    const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery, 5);
+    const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery);
 
     const prompt = buildRagPrompt(parents, userQuery);
 
     let aiResponse = '';
+    let llmFailed  = false;
     try {
       const response = await this.llm.invoke(prompt);
 
@@ -669,20 +894,24 @@ export class RagService implements OnModuleInit {
         aiResponse = textPart && 'text' in textPart ? (textPart as any).text : '';
       }
 
-      const finishReason =
-        (response as any).response_metadata?.finish_reason ??
-        (response as any).generationInfo?.finish_reason ??
-        'unknown';
+      const finishReason = resolveFinishReason(response);
       if (finishReason && finishReason !== 'STOP') {
         this.logger.warn(`[LLM] finishReason inesperado: ${finishReason}`);
       }
     } catch (err: any) {
+      llmFailed = true;
       this.logger.error(
         `[LLM] Falha em llm.invoke — status=${err?.status ?? err?.code ?? 'n/a'} | message=${err?.message ?? String(err)}`,
       );
     }
 
-    if (!aiResponse.trim()) {
+    // Falha tecnica NAO pode ser confundida com ausencia de informacao nos
+    // documentos: a mensagem de recusa e um sinal de conteudo para o usuario,
+    // enquanto a falha de LLM e um problema transitorio de infraestrutura.
+    if (llmFailed) {
+      aiResponse =
+        'Nao foi possivel gerar a resposta neste momento devido a uma falha tecnica na comunicacao com o modelo. Tente novamente em alguns instantes.';
+    } else if (!aiResponse.trim()) {
       aiResponse =
         'As informacoes disponiveis nos documentos indexados nao sao suficientes para responder a esta pergunta com precisao.';
     }

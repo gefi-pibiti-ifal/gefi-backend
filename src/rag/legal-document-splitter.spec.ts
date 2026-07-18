@@ -6,6 +6,9 @@ import {
   isStructuralItem,
   extractItemHeader,
   splitLegalDocument,
+  splitIntoChildChunks,
+  CHILD_CHUNK_SIZE,
+  CHILD_CHUNK_OVERLAP,
 } from './legal-document-splitter';
 
 // ---------------------------------------------------------------------------
@@ -446,5 +449,54 @@ describe('splitLegalDocument — preservação de conteúdo', () => {
     const chunk103 = chunks.find(c => c.metadata.n2_header === '10.3.');
     expect(chunk103).toBeDefined();
     expect(chunk103!.content).toContain('Fiscalização diária');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// splitLegalDocument — integridade do parent (Fase 1)
+//
+// Contrato: cada grupo estrutural e emitido como UM chunk com o texto
+// integro do buffer. A derivacao dos children (janelas com overlap) acontece
+// na ingestao, sobre o conteudo final do parent. Antes, o splitter emitia os
+// children direto e o parent era reconstruido pelo join — duplicando ~80
+// chars de overlap a cada fronteira e inserindo \n no meio de palavra.
+// ---------------------------------------------------------------------------
+describe('splitLegalDocument — integridade do parent', () => {
+  test('grupo maior que CHILD_CHUNK_SIZE e emitido como um unico chunk integro', () => {
+    const frase       = 'Frase de conteudo normativo repetida para exceder o tamanho de child. ';
+    const longContent = frase.repeat(15).trim(); // ~1050 chars > CHILD_CHUNK_SIZE
+    const text = [
+      'ANEXO VIII-B',
+      '10.2. Fiscalizacao mensal',
+      longContent,
+    ].join('\n');
+
+    const chunks   = splitLegalDocument(text);
+    const grupo102 = chunks.filter(c => c.metadata.n2_header === '10.2.');
+
+    expect(grupo102).toHaveLength(1);
+    expect(grupo102[0].content.length).toBeGreaterThan(CHILD_CHUNK_SIZE);
+    expect(grupo102[0].content).toContain('10.2. Fiscalizacao mensal');
+    expect(grupo102[0].content).toContain(longContent);
+  });
+
+  test('splitIntoChildChunks gera janelas que sao substrings exatas do texto original', () => {
+    const text     = 'Conteudo normativo de exemplo. '.repeat(80); // ~2480 chars
+    const children = splitIntoChildChunks(text);
+
+    expect(children.length).toBeGreaterThan(1);
+    for (const child of children) {
+      expect(text).toContain(child);
+    }
+  });
+
+  test('splitIntoChildChunks preserva o overlap entre janelas consecutivas', () => {
+    const text     = 'Conteudo normativo de exemplo. '.repeat(80);
+    const children = splitIntoChildChunks(text);
+
+    for (let i = 1; i < children.length; i++) {
+      const overlapHead = children[i].slice(0, CHILD_CHUNK_OVERLAP);
+      expect(children[i - 1].endsWith(overlapHead)).toBe(true);
+    }
   });
 });

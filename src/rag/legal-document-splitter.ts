@@ -304,6 +304,12 @@ export function extractItemHeader(line: string): string {
 export const CHILD_CHUNK_SIZE    = 600;
 export const CHILD_CHUNK_OVERLAP = 80;
 
+// Um HierarchicalChunk representa um grupo estrutural COMPLETO (material do
+// ParentChunk): o texto e a integra original do buffer, sem cortes.
+// A derivacao dos child chunks (janelas de CHILD_CHUNK_SIZE com overlap)
+// acontece na ingestao (rag.service), sobre o conteudo final do parent —
+// nunca antes. Reconstruir o parent a partir de children com overlap
+// duplicava ~80 chars a cada fronteira e inseria quebras no meio de palavra.
 export interface HierarchicalChunk {
   content: string;
   metadata: {
@@ -312,7 +318,7 @@ export interface HierarchicalChunk {
   };
 }
 
-function splitIntoChildChunks(text: string): string[] {
+export function splitIntoChildChunks(text: string): string[] {
   const chunks: string[] = [];
   let start = 0;
   while (start < text.length) {
@@ -369,14 +375,10 @@ export function splitLegalDocument(cleanedText: string): HierarchicalChunk[] {
       }
       return;
     }
-    const n1         = resolveN1();
-    const n2         = currentArtigoItem;
-    const childTexts = trimmed.length > CHILD_CHUNK_SIZE
-      ? splitIntoChildChunks(trimmed)
-      : [trimmed];
-    for (const content of childTexts) {
-      result.push({ content, metadata: { n1_header: n1, n2_header: n2 } });
-    }
+    result.push({
+      content: trimmed,
+      metadata: { n1_header: resolveN1(), n2_header: currentArtigoItem },
+    });
   }
 
   for (const rawLine of lines) {

@@ -1,4 +1,14 @@
-import { normalizeForSearch } from './rag.service';
+import {
+  normalizeForSearch,
+  findAnchorIndex,
+  snapWindowStart,
+  snapWindowEnd,
+  buildRagPrompt,
+  buildSourceLabel,
+  stripInvisibleArtifacts,
+  dehyphenateAttested,
+} from './rag.service';
+import { Document } from '@langchain/core/documents';
 import {
   CHILD_CHUNK_SIZE,
   CHILD_CHUNK_OVERLAP,
@@ -338,5 +348,278 @@ describe('I3 — sourceDocIds alinhado com sources (invariante)', () => {
     const { sourceDocIds, sources } = buildSourcesFromParents([]);
     expect(sourceDocIds).toHaveLength(0);
     expect(sources).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findAnchorIndex — implementacao REAL usada pela janela deslizante (Fase 1).
+// Substitui a simulacao findAnchorWithFallback acima: anchor progressivo
+// (50 -> 40 -> 30 -> 20) com tolerancia a whitespace via regex.
+// ---------------------------------------------------------------------------
+describe('findAnchorIndex (implementacao real da janela deslizante)', () => {
+  test('child substring exata do parent -> encontra o indice correto', () => {
+    const parent = 'Preambulo do item. 10.2. Fiscalizacao mensal dos servicos contratados conforme o edital vigente.';
+    const child  = '10.2. Fiscalizacao mensal dos servicos contratados conforme';
+    expect(findAnchorIndex(parent, child)).toBe(parent.indexOf('10.2.'));
+  });
+
+  test('tolera quebra de linha no parent onde o child tem espaco', () => {
+    const parent = 'Fiscalizacao\nmensal dos servicos contratados conforme edital aqui presente.';
+    const child  = 'Fiscalizacao mensal dos servicos contratados conforme edital aqui presente.';
+    expect(findAnchorIndex(parent, child)).toBe(0);
+  });
+
+  test('tolera multiplos espacos no parent', () => {
+    const parent = 'Fiscalizacao     mensal dos servicos contratados no periodo.';
+    const child  = 'Fiscalizacao mensal dos servicos contratados no periodo.';
+    expect(findAnchorIndex(parent, child)).toBe(0);
+  });
+
+  test('anchor de 50 nao casa mas anchor menor casa (fallback progressivo)', () => {
+    const head20 = 'Fiscalizacao mensal ';
+    const parent = `${head20}restante completamente distinto do child aqui.`;
+    const child  = `${head20}continuacao que nao esta presente no parent de forma alguma.`;
+    expect(findAnchorIndex(parent, child)).toBe(0);
+  });
+
+  test('anchor inexistente em qualquer tamanho -> -1 (parent entra integro)', () => {
+    const parent = 'Conteudo completamente diferente do child.';
+    const child  = 'XYZXYZXYZ conteudo que nao existe no parent de forma alguma.';
+    expect(findAnchorIndex(parent, child)).toBe(-1);
+  });
+
+  test('caracteres especiais de regex no child nao quebram a busca', () => {
+    const parent = 'Item (a) — valor de R$ 1.000,00 [reajustado] conforme indice oficial.';
+    const child  = '(a) — valor de R$ 1.000,00 [reajustado] conforme indice';
+    expect(findAnchorIndex(parent, child)).toBe(parent.indexOf('(a)'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// snapWindowStart / snapWindowEnd — ajuste das bordas da janela para
+// fronteiras de sentenca/linha (evita cortar dispositivos no meio da frase)
+// ---------------------------------------------------------------------------
+describe('snapWindowStart / snapWindowEnd', () => {
+  test('start recua para o inicio da sentenca corrente', () => {
+    const content = 'Primeira sentenca completa. Segunda sentenca que sera cortada no meio.';
+    const mid = content.indexOf('que sera');
+    expect(snapWindowStart(content, mid)).toBe(content.indexOf('Segunda'));
+  });
+
+  test('start em 0 permanece 0', () => {
+    expect(snapWindowStart('qualquer texto', 0)).toBe(0);
+  });
+
+  test('sem fronteira no alcance de busca: mantem o start original', () => {
+    const content = 'a'.repeat(400) + ' fim';
+    expect(snapWindowStart(content, 350)).toBe(350);
+  });
+
+  test('start apos quebra de linha usa a quebra como fronteira', () => {
+    const content = 'linha um\nlinha dois com mais conteudo aqui';
+    const mid = content.indexOf('com mais');
+    expect(snapWindowStart(content, mid)).toBe(content.indexOf('linha dois'));
+  });
+
+  test('end avanca ate o fim da sentenca corrente (inclui o ponto)', () => {
+    const content = 'Primeira parte da sentenca que continua. Proxima sentenca aqui.';
+    const end = snapWindowEnd(content, content.indexOf('continua'));
+    expect(content.slice(0, end).endsWith('continua.')).toBe(true);
+  });
+
+  test('end no fim do conteudo permanece inalterado', () => {
+    const content = 'Texto curto.';
+    expect(snapWindowEnd(content, content.length)).toBe(content.length);
+  });
+
+  test('quebra de linha antes do ponto: para na quebra', () => {
+    const content = 'linha um\nlinha dois. resto';
+    expect(snapWindowEnd(content, 0)).toBe(content.indexOf('\n'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSourceLabel / buildRagPrompt — citacoes estruturais e regras de
+// fidelidade (fase de geracao). Testa invariantes estruturais do prompt,
+// nao a redacao exata das instrucoes.
+// ---------------------------------------------------------------------------
+function makeDoc(metadata: Record<string, unknown>, pageContent = 'Conteudo do item.'): Document {
+  return new Document({ pageContent, metadata });
+}
+
+describe('buildSourceLabel', () => {
+  test('rotulo completo: titulo + anexo + item', () => {
+    const doc = makeDoc({
+      title: 'Edital de Credenciamento 2026',
+      n1_header: 'ANEXO VIII-B',
+      n2_header: '10.2.',
+      sectionHeader: '10.2.',
+    });
+    expect(buildSourceLabel(doc, 0)).toBe(
+      '[Trecho 1] Documento: "Edital de Credenciamento 2026" | ANEXO VIII-B | Item 10.2.',
+    );
+  });
+
+  test('artigo nao recebe prefixo "Item"', () => {
+    const doc = makeDoc({
+      title: 'Portaria 15',
+      n1_header: 'CAPÍTULO II',
+      n2_header: 'Art. 39',
+      sectionHeader: 'Art. 39',
+    });
+    expect(buildSourceLabel(doc, 2)).toBe(
+      '[Trecho 3] Documento: "Portaria 15" | CAPÍTULO II | Art. 39',
+    );
+  });
+
+  test('sem n2_header usa sectionHeader quando nao repete o n1', () => {
+    const doc = makeDoc({
+      title: 'Edital X',
+      n1_header: 'ANEXO I',
+      n2_header: '',
+      sectionHeader: 'Disposicoes gerais',
+    });
+    expect(buildSourceLabel(doc, 0)).toContain('Item Disposicoes gerais');
+  });
+
+  test('metadados ausentes nao quebram o rotulo', () => {
+    const doc = makeDoc({});
+    expect(buildSourceLabel(doc, 0)).toBe('[Trecho 1] Documento: "Documento sem titulo"');
+  });
+
+  test('role interno definido no retrieval NAO vaza para o rotulo', () => {
+    const principal = makeDoc({
+      title: 'Edital A', n1_header: 'ANEXO VIII-B', n2_header: '10.2.', sectionHeader: '10.2.', role: 'PRINCIPAL',
+    });
+    const apoio = makeDoc({
+      title: 'Edital A', n1_header: 'ANEXO VIII-B', n2_header: '9.', sectionHeader: '9.', role: 'COMPLEMENTAR',
+    });
+    // A prioridade e sinalizada pela ORDEM dos trechos, nunca por vocabulario
+    // interno que o modelo poderia ecoar na resposta.
+    expect(buildSourceLabel(principal, 0)).toBe(
+      '[Trecho 1] Documento: "Edital A" | ANEXO VIII-B | Item 10.2.',
+    );
+    expect(buildSourceLabel(apoio, 1)).toBe(
+      '[Trecho 2] Documento: "Edital A" | ANEXO VIII-B | Item 9.',
+    );
+  });
+});
+
+describe('buildRagPrompt', () => {
+  const docs = [
+    makeDoc(
+      { title: 'Edital A', n1_header: 'ANEXO VIII-B', n2_header: '9.', sectionHeader: '9.' },
+      '9. Rotinas gerais de fiscalizacao aqui descritas.',
+    ),
+    makeDoc(
+      { title: 'Edital A', n1_header: 'ANEXO VIII-B', n2_header: '10.2.', sectionHeader: '10.2.' },
+      '10.2. Fiscalizacao mensal com suas alineas.',
+    ),
+  ];
+  const prompt = buildRagPrompt(docs, 'Quais sao as rotinas da fiscalizacao mensal?');
+
+  test('cada trecho aparece com rotulo estrutural e conteudo', () => {
+    expect(prompt).toContain('[Trecho 1] Documento: "Edital A" | ANEXO VIII-B | Item 9.');
+    expect(prompt).toContain('[Trecho 2] Documento: "Edital A" | ANEXO VIII-B | Item 10.2.');
+    expect(prompt).toContain('9. Rotinas gerais de fiscalizacao aqui descritas.');
+    expect(prompt).toContain('10.2. Fiscalizacao mensal com suas alineas.');
+  });
+
+  test('inclui a pergunta do usuario', () => {
+    expect(prompt).toContain('Pergunta: Quais sao as rotinas da fiscalizacao mensal?');
+  });
+
+  test('mantem a string exata de recusa (comportamento downstream preservado)', () => {
+    expect(prompt).toContain('"As informacoes disponiveis nao sao suficientes."');
+  });
+
+  test('nao usa mais o rotulo efemero "Documento Ref"', () => {
+    expect(prompt).not.toContain('Documento Ref');
+  });
+
+  test('nao contem mais instrucoes que induzem resumo/reformatacao', () => {
+    expect(prompt).not.toContain('Evite blocos longos');
+    expect(prompt).not.toContain('marcadores (•)');
+  });
+
+  test('proibe abertura mecanica que descreve o sistema em vez de responder', () => {
+    expect(prompt).toContain('RESPONDA A PERGUNTA, NAO DESCREVA O SISTEMA');
+    // A frase-modelo da versao anterior (meta-descricao do retrieval) sumiu
+    expect(prompt).not.toContain(
+      'Foram recuperados os seguintes dispositivos relacionados ao tema solicitado',
+    );
+    expect(prompt).not.toContain('HIERARQUIA DAS FONTES');
+    expect(prompt).not.toContain('MAIS DE UM ITEM NORMATIVO');
+  });
+
+  test('define os dois modos de resposta (explicativo e transcricao literal)', () => {
+    expect(prompt).toContain('Pergunta explicativa');
+    expect(prompt).toContain('Pedido de transcricao');
+    expect(prompt).toContain('nao resuma, nao reorganize, nao omita e nao acrescente nada');
+    expect(prompt).toContain('nao copie secoes inteiras da norma');
+  });
+
+  test('sinaliza ordenacao por pertinencia e exige fontes apenas ao final', () => {
+    expect(prompt).toContain('ordenados por pertinencia');
+    expect(prompt).toContain('FONTES AO FINAL');
+    expect(prompt).toContain('Fontes:');
+    expect(prompt).toContain('Nao numere as fontes nem use rotulos internos');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// stripInvisibleArtifacts — normalizacao segura de artefatos de PDF.
+// Nenhum conteudo visivel e alterado: apenas caracteres invisiveis,
+// NBSP e ligaturas tipograficas.
+// ---------------------------------------------------------------------------
+describe('stripInvisibleArtifacts', () => {
+  test('remove soft hyphen invisivel no meio de palavra', () => {
+    expect(stripInvisibleArtifacts('fiscali­zacao')).toBe('fiscalizacao');
+  });
+
+  test('normaliza NBSP para espaco comum', () => {
+    expect(stripInvisibleArtifacts('Art. 39')).toBe('Art. 39');
+  });
+
+  test('remove zero-width chars e BOM', () => {
+    expect(stripInvisibleArtifacts('a​b‌c‍d﻿e')).toBe('abcde');
+  });
+
+  test('expande ligaturas tipograficas de PDF', () => {
+    expect(stripInvisibleArtifacts('ﬁscalizacao')).toBe('fiscalizacao');
+    expect(stripInvisibleArtifacts('conﬂito')).toBe('conflito');
+  });
+
+  test('texto limpo passa inalterado', () => {
+    const text = '10.2. Fiscalizacao mensal dos servicos.';
+    expect(stripInvisibleArtifacts(text)).toBe(text);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dehyphenateAttested — de-hifenizacao atestada pelo proprio documento:
+// so une quando a palavra integra ocorre em outro ponto do texto.
+// ---------------------------------------------------------------------------
+describe('dehyphenateAttested', () => {
+  test('une palavra hifenizada quando a forma integra ocorre no documento', () => {
+    const text = 'A fiscalizacao mensal e obrigatoria. A fiscali-\nzacao deve ocorrer todo mes.';
+    const out  = dehyphenateAttested(text);
+    expect(out).toContain('A fiscalizacao deve ocorrer todo mes.');
+    expect(out).not.toContain('fiscali-\nzacao');
+  });
+
+  test('preserva composto legitimo quebrado no proprio hifen (sem atestado)', () => {
+    const text = 'Nos termos do decreto-\nlei aplicavel ao caso concreto.';
+    expect(dehyphenateAttested(text)).toBe(text);
+  });
+
+  test('sem atestado nada e alterado (nao inventa palavras)', () => {
+    const text = 'A fiscali-\nzacao deve ocorrer todo mes.';
+    expect(dehyphenateAttested(text)).toBe(text);
+  });
+
+  test('texto sem hifenizacao de quebra passa inalterado', () => {
+    const text = 'Texto comum sem quebras hifenizadas, incluindo decreto-lei intacto.';
+    expect(dehyphenateAttested(text)).toBe(text);
   });
 });

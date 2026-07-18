@@ -7,9 +7,9 @@ export declare class ChatController {
     createConversation(body: {
         title: string;
     }, req: any): Promise<{
+        title: string;
         id: string;
         created_at: Date;
-        title: string;
         updated_at: Date;
         deleted_at: Date | null;
         is_pinned: boolean;
@@ -17,9 +17,9 @@ export declare class ChatController {
     }>;
     getConversations(req: any, page?: string, limit?: string): Promise<{
         data: {
+            title: string;
             id: string;
             created_at: Date;
-            title: string;
             is_pinned: boolean;
         }[];
         meta: {
@@ -39,9 +39,9 @@ export declare class ChatController {
             conversation_id: string;
         }[];
     } & {
+        title: string;
         id: string;
         created_at: Date;
-        title: string;
         updated_at: Date;
         deleted_at: Date | null;
         is_pinned: boolean;
@@ -82,9 +82,9 @@ export declare class ChatController {
     renameConversation(id: string, body: {
         title: string;
     }, req: any): Promise<{
+        title: string;
         id: string;
         created_at: Date;
-        title: string;
         updated_at: Date;
         deleted_at: Date | null;
         is_pinned: boolean;
@@ -93,18 +93,18 @@ export declare class ChatController {
     togglePin(id: string, body: {
         is_pinned: boolean;
     }, req: any): Promise<{
+        title: string;
         id: string;
         created_at: Date;
-        title: string;
         updated_at: Date;
         deleted_at: Date | null;
         is_pinned: boolean;
         user_id: string;
     }>;
     softDelete(id: string, req: any): Promise<{
+        title: string;
         id: string;
         created_at: Date;
-        title: string;
         updated_at: Date;
         deleted_at: Date | null;
         is_pinned: boolean;

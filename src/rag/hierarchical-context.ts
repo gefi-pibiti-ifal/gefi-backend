@@ -30,8 +30,13 @@ import type { Prisma } from '@prisma/client';
 /** Número máximo de ParentChunks enviados ao LLM após expansão. */
 export const MAX_EXPANDED_PARENTS = 8;
 
-/** Limite total de caracteres do contexto enviado ao LLM. */
-export const MAX_EXPANDED_CHARS = 12_000;
+/**
+ * Limite total de caracteres do contexto enviado ao LLM.
+ * Com parents integros (janela deslizante so acima de 3500 chars) e
+ * RETRIEVAL_FETCH_K=12, 12k passou a cortar parents relevantes no flatten.
+ * 24k chars (~6k tokens) segue trivial para o contexto do gemini-2.5-flash.
+ */
+export const MAX_EXPANDED_CHARS = 24_000;
 
 /**
  * Distância máxima (em posição de inserção no banco) entre o top parent
@@ -194,9 +199,13 @@ export function buildClusters(
 export function applyHierarchicalBoost(clusters: RetrievalCluster[]): RetrievalCluster[] {
   if (!HIERARCHICAL_BOOST_ENABLED) return clusters;
 
-  // Ordena por hitCount decrescente; empate: mantém ordem original (índice).
+  // Ordena por hitCount decrescente; empate: melhor score vetorial primeiro
+  // (menor distancia = mais relevante). Antes o empate preservava apenas a
+  // ordem de insercao e o bestScore ja calculado era ignorado — dois hits
+  // medianos superavam um hit excelente sem criterio de qualidade.
   return [...clusters].sort((a, b) => {
     if (b.hitCount !== a.hitCount) return b.hitCount - a.hitCount;
+    if (a.bestScore !== b.bestScore) return a.bestScore - b.bestScore;
     return 0; // estável: preserva ordem de inserção
   });
 }

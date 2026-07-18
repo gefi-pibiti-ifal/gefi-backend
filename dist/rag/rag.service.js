@@ -45,6 +45,12 @@ var RagService_1;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RagService = void 0;
 exports.normalizeForSearch = normalizeForSearch;
+exports.findAnchorIndex = findAnchorIndex;
+exports.snapWindowStart = snapWindowStart;
+exports.snapWindowEnd = snapWindowEnd;
+exports.stripInvisibleArtifacts = stripInvisibleArtifacts;
+exports.dehyphenateAttested = dehyphenateAttested;
+exports.buildSourceLabel = buildSourceLabel;
 exports.buildRagPrompt = buildRagPrompt;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
@@ -63,10 +69,14 @@ const EMBEDDING_BATCH_SIZE = 15;
 const EMBEDDING_BATCH_DELAY = 10_000;
 const EMBEDDING_RETRY_DELAY = 65_000;
 const EMBEDDING_MAX_RETRIES = 5;
+const RETRIEVAL_FETCH_K = 12;
+const MAX_SIBLINGS_PER_GROUP = 3;
 const MIN_PARENT_CONTENT_LENGTH = 80;
-const SLIDING_WINDOW_BEFORE = 400;
-const SLIDING_WINDOW_AFTER = 800;
+const SLIDING_WINDOW_MIN_PARENT_LENGTH = 3500;
+const SLIDING_WINDOW_BEFORE = 1200;
+const SLIDING_WINDOW_AFTER = 2400;
 const SLIDING_WINDOW_ANCHOR_SIZES = [50, 40, 30, 20];
+const SENTENCE_SNAP_RANGE = 300;
 const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 function chunkArray(arr, size) {
     const batches = [];
@@ -112,8 +122,77 @@ function isPdfNoiseAllCaps(line) {
 function normalizeForSearch(text) {
     return text.replace(/\s+/g, ' ').trim();
 }
+function trace(...args) {
+    if (DEBUG_RAG)
+        console.log(...args);
+}
+function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function findAnchorIndex(parentContent, childContent) {
+    for (const size of SLIDING_WINDOW_ANCHOR_SIZES) {
+        const anchor = childContent.slice(0, size).trim();
+        if (anchor.length < 10)
+            continue;
+        const pattern = new RegExp(escapeRegExp(anchor).replace(/\s+/g, '\\s+'));
+        const match = pattern.exec(parentContent);
+        if (match)
+            return match.index;
+    }
+    return -1;
+}
+function snapWindowStart(content, start) {
+    if (start <= 0)
+        return start;
+    const from = Math.max(0, start - SENTENCE_SNAP_RANGE);
+    const region = content.slice(from, start);
+    const breakAt = Math.max(region.lastIndexOf('\n'), region.lastIndexOf('. '));
+    if (breakAt === -1)
+        return start;
+    const isSentence = region.slice(breakAt, breakAt + 2) === '. ';
+    return from + breakAt + (isSentence ? 2 : 1);
+}
+function snapWindowEnd(content, end) {
+    if (end >= content.length)
+        return end;
+    const region = content.slice(end, Math.min(content.length, end + SENTENCE_SNAP_RANGE));
+    const nl = region.indexOf('\n');
+    const dot = region.indexOf('. ');
+    const stops = [];
+    if (nl !== -1)
+        stops.push(nl);
+    if (dot !== -1)
+        stops.push(dot + 1);
+    if (stops.length === 0)
+        return end;
+    return end + Math.min(...stops);
+}
+const PDF_LIGATURES = [
+    [/ﬀ/g, 'ff'],
+    [/ﬁ/g, 'fi'],
+    [/ﬂ/g, 'fl'],
+    [/ﬃ/g, 'ffi'],
+    [/ﬄ/g, 'ffl'],
+];
+function stripInvisibleArtifacts(text) {
+    let out = text
+        .replace(/[\u00AD\u200B\u200C\u200D\uFEFF]/g, '')
+        .replace(/\u00A0/g, ' ');
+    for (const [re, expanded] of PDF_LIGATURES)
+        out = out.replace(re, expanded);
+    return out;
+}
+function dehyphenateAttested(text) {
+    const words = new Set();
+    for (const token of text.split(/[^\p{L}]+/u)) {
+        if (token.length >= 4)
+            words.add(token.toLowerCase());
+    }
+    return text.replace(/(\p{L}{2,})-\n(\p{Ll}{2,})/gu, (match, a, b) => words.has(`${a}${b}`.toLowerCase()) ? `${a}${b}` : match);
+}
 function cleanExtractedText(raw) {
-    return raw
+    const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw));
+    return preprocessed
         .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
         .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
         .replace(/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s\/\-\.]{5,80}$/gm, (match) => {
@@ -140,87 +219,65 @@ function resolveFinishReason(response) {
         response?.generationInfo?.finish_reason ??
         'unknown');
 }
+function buildSourceLabel(doc, index) {
+    const md = doc.metadata;
+    const title = typeof md.title === 'string' && md.title ? md.title : 'Documento sem titulo';
+    const n1 = typeof md.n1_header === 'string' ? md.n1_header : '';
+    const n2 = typeof md.n2_header === 'string' ? md.n2_header : '';
+    const section = typeof md.sectionHeader === 'string' ? md.sectionHeader : '';
+    const parts = [`Documento: "${title}"`];
+    if (n1)
+        parts.push(n1);
+    const item = n2 || (section !== n1 ? section : '');
+    if (item)
+        parts.push(/^art/i.test(item) ? item : `Item ${item}`);
+    return `[Trecho ${index + 1}] ${parts.join(' | ')}`;
+}
 function buildRagPrompt(contexts, userQuery) {
     const contextBlock = contexts
-        .map((doc, i) => {
-        const section = doc.metadata.sectionHeader;
-        const n2 = doc.metadata.n2_header;
-        const label = n2 && n2 !== section ? `${section} — ${n2}` : section;
-        return `[Documento Ref ${i + 1}] (${label})\n${doc.pageContent}`;
-    })
+        .map((doc, i) => `${buildSourceLabel(doc, i)}\n${doc.pageContent}`)
         .join('\n\n---\n\n');
-    return `Voce e um assistente especializado em documentos normativos e administrativos.
+    return `Voce e um assistente especializado em normas e documentos administrativos brasileiros. Quem pergunta e um servidor publico que precisa de uma resposta clara, correta e util para aplicar a norma no dia a dia.
 
-Os documentos de referencia abaixo estao ordenados por relevancia. O Documento Ref 1 e sempre o mais relevante para a pergunta.
+Abaixo estao trechos de documentos normativos, cada um com uma anotacao interna de origem (documento, anexo, item). Os trechos estao ordenados por pertinencia — o primeiro e o mais diretamente relacionado a pergunta. As anotacoes, os rotulos [Trecho N] e o mecanismo de selecao de trechos sao detalhes internos do sistema e nao fazem parte da resposta.
 
-REGRAS OBRIGATORIAS:
+COMO RESPONDER:
 
-1. FONTE PRINCIPAL
-   Use o Documento Ref 1 como fonte primaria.
-   Somente consulte os demais documentos se o Ref 1 nao responder completamente a pergunta.
-   Se o Ref 1 responder integralmente, ignore os demais documentos por completo.
+1. RESPONDA A PERGUNTA, NAO DESCREVA O SISTEMA
+   Comece respondendo diretamente o que foi perguntado, em linguagem natural, como um especialista que conhece a norma.
+   Nunca abra a resposta comentando os documentos ou trechos ("Foram recuperados...", "Os dispositivos encontrados...", "O contexto contem...").
+   Nunca use na resposta termos internos como "Fonte 1", "Trecho 2", "documento principal", "documento complementar", "contexto recuperado".
 
-2. FIDELIDADE AO TEXTO
-   Preserve a redacao original do documento.
-   Nao parafraseie, nao reinterprete e nao reescreva procedimentos administrativos ou juridicos.
-   A fidelidade ao texto tem prioridade sobre reformulacoes stilisticas.
+2. ESCOLHA O MODO PELO TIPO DE PERGUNTA
+   a) Pergunta explicativa ("quais sao...", "como funciona...", "o que deve...", "quando..."):
+      - responda de forma direta e organizada, sintetizando com fidelidade o que a norma determina;
+      - use topicos quando facilitarem a leitura;
+      - preserve com exatidao numeros, prazos, valores, percentuais, obrigacoes e a numeracao dos dispositivos, citando-a de forma natural no texto (ex: "conforme o item 10.2.1 do Anexo VIII-B");
+      - transcreva literalmente apenas passagens curtas em que a redacao exata importa;
+      - nao copie secoes inteiras da norma quando uma sintese fiel responde a pergunta.
+   b) Pedido de transcricao ("transcreva...", "copie...", "reproduza...", "mostre na integra...", "texto exato..."):
+      - reproduza o texto literalmente, completo e na ordem original;
+      - mantenha a numeracao e a estrutura originais (itens, subitens, alineas, incisos);
+      - nao resuma, nao reorganize, nao omita e nao acrescente nada.
 
-3. PRESERVACAO DE LISTAS
-   Quando o documento apresentar listas numeradas, alineas ou itens (a, b, c... / I, II, III...):
-   - reproduza todos os itens sem excecao;
-   - mantenha exatamente a ordem original;
-   - nao reorganize, nao agrupe e nao omita nenhum item;
-   - nao crie novos itens.
-   Se o documento tiver quatro alineas, a resposta deve conter exatamente quatro alineas.
-
-4. NAO TRUNCAR CONTEUDO
-   Nunca interrompa frases, dispositivos legais ou referencias normativas.
-   Sempre conclua a frase utilizando todo o conteudo disponivel no contexto.
-   Se o trecho estiver incompleto por limitacao do contexto, nao invente a continuacao.
-
-5. FORMATO DA RESPOSTA
-   Utilize preferencialmente:
-   - Uma frase de introducao curta.
-   - Lista com marcadores (•) reproduzindo os itens do documento na ordem original.
-   Evite blocos longos de texto corrido.
-
-6. CITACAO OBRIGATORIA
-   Ao final da resposta, informe a referencia de forma especifica:
-
-   Fonte:
-   - Documento Ref X — Item X.X (titulo do item, se houver)
-
-   Se mais de um documento foi utilizado:
-   Fonte:
-   - Documento Ref 1 — Item X.X (titulo)
-   - Documento Ref 3 — Item Y.Y (titulo)
-
-   Somente cite documentos cujas informacoes foram efetivamente utilizadas na resposta.
-
-7. PROIBICOES
-   Nao inclua:
-   - interpretacoes juridicas;
-   - comentarios ou observacoes extras;
-   - exemplos nao presentes no documento;
-   - recomendacoes;
-   - contexto historico;
-   - explicacoes adicionais nao solicitadas.
-   Responda apenas ao que foi perguntado.
-
-8. AUSENCIA DE INFORMACAO
-   Se a informacao nao constar em nenhum documento, responda EXATAMENTE:
+3. FIDELIDADE AO TEXTO NORMATIVO
+   Use somente o conteudo dos trechos fornecidos; nao use conhecimento externo.
+   Nao invente dispositivos, numeros ou continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
+   Nao faca interpretacao juridica, recomendacao ou opiniao alem do que a norma diz.
+   Se os trechos nao contiverem a informacao perguntada, responda EXATAMENTE:
    "As informacoes disponiveis nao sao suficientes."
 
-9. SINTESE DE CONTEXTO RELACIONADO
-   Se os documentos recuperados pertencerem ao mesmo contexto estrutural ou n1_header,
-   sintetize as informacoes complementares.
-   preserve a origem de cada informacao indicando o item correspondente.
-   Nao repita conteudos identicos.
-   Nao ignore documentos relacionados recuperados.
+4. FONTES AO FINAL
+   Encerre a resposta com um bloco de referencias, uma por linha:
 
---- INICIO DOS DOCUMENTOS DE REFERENCIA ---
+   Fontes:
+   - <titulo do documento> — <anexo ou capitulo, se houver> — <item ou artigo>
+
+   Liste apenas os dispositivos efetivamente usados na resposta. Nao numere as fontes nem use rotulos internos.
+
+--- TRECHOS DOS DOCUMENTOS (uso interno) ---
 ${contextBlock}
---- FIM DOS DOCUMENTOS DE REFERENCIA ---
+--- FIM DOS TRECHOS ---
 
 Pergunta: ${userQuery}
 
@@ -245,7 +302,8 @@ let RagService = RagService_1 = class RagService {
         this.llm = new google_genai_1.ChatGoogleGenerativeAI({
             apiKey,
             model: 'gemini-2.5-flash',
-            temperature: 0.4,
+            temperature: 0.1,
+            maxOutputTokens: 8192,
             safetySettings: [
                 { category: generative_ai_2.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE },
                 { category: generative_ai_2.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE },
@@ -271,9 +329,6 @@ let RagService = RagService_1 = class RagService {
     async indexDocument(rawContent, documentId, title) {
         const cleanedText = cleanExtractedText(rawContent);
         const chunks = (0, legal_document_splitter_1.splitLegalDocument)(cleanedText);
-        const BATCH_SIZE = 15;
-        const BATCH_DELAY = 10000;
-        const RETRY_DELAY = 65000;
         let totalChildren = 0;
         const groupMap = new Map();
         for (const chunk of chunks) {
@@ -285,12 +340,9 @@ let RagService = RagService_1 = class RagService {
                     n2_header,
                     sectionHeader: (n2_header || n1_header || 'Secao').slice(0, 255),
                     contentParts: [],
-                    childContents: [],
                 });
             }
-            const entry = groupMap.get(key);
-            entry.contentParts.push(chunk.content);
-            entry.childContents.push(chunk.content);
+            groupMap.get(key).contentParts.push(chunk.content);
         }
         const allChildDocs = [];
         for (const entry of groupMap.values()) {
@@ -308,7 +360,10 @@ let RagService = RagService_1 = class RagService {
                     },
                 },
             });
-            for (const childContent of entry.childContents) {
+            const childContents = fullContent.length > legal_document_splitter_1.CHILD_CHUNK_SIZE
+                ? (0, legal_document_splitter_1.splitIntoChildChunks)(fullContent)
+                : [fullContent];
+            for (const childContent of childContents) {
                 allChildDocs.push(new documents_1.Document({
                     pageContent: childContent,
                     metadata: {
@@ -321,12 +376,12 @@ let RagService = RagService_1 = class RagService {
                 }));
             }
         }
-        const batches = chunkArray(allChildDocs, BATCH_SIZE);
+        const batches = chunkArray(allChildDocs, EMBEDDING_BATCH_SIZE);
         for (let i = 0; i < batches.length; i++) {
             const batch = batches[i];
             this.logger.log(`[RAG] Vetorizando lote ${i + 1}/${batches.length} (${batch.length} chunks)...`);
             let attempt = 0;
-            while (attempt < 5) {
+            while (attempt < EMBEDDING_MAX_RETRIES) {
                 try {
                     await this.vectorStore.addDocuments(batch);
                     totalChildren += batch.length;
@@ -336,9 +391,9 @@ let RagService = RagService_1 = class RagService {
                     const is429 = err?.status === 429 ||
                         String(err?.message).includes('429') ||
                         String(err?.message).toLowerCase().includes('quota');
-                    if (is429 && attempt < 4) {
-                        this.logger.warn(`[RAG] Rate limit (429) no lote ${i + 1}. Aguardando ${RETRY_DELAY / 1000}s...`);
-                        await delay(RETRY_DELAY);
+                    if (is429 && attempt < EMBEDDING_MAX_RETRIES - 1) {
+                        this.logger.warn(`[RAG] Rate limit (429) no lote ${i + 1}. Aguardando ${EMBEDDING_RETRY_DELAY / 1000}s...`);
+                        await delay(EMBEDDING_RETRY_DELAY);
                         attempt++;
                     }
                     else {
@@ -347,48 +402,55 @@ let RagService = RagService_1 = class RagService {
                 }
             }
             if (i < batches.length - 1)
-                await delay(BATCH_DELAY);
+                await delay(EMBEDDING_BATCH_DELAY);
         }
         this.logger.log(`Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados`);
         return { success: true, documentId, sections: groupMap.size, childChunks: totalChildren };
     }
-    async retrieveParentContexts(userQuery, k = 5) {
+    async retrieveParentContexts(userQuery, k = RETRIEVAL_FETCH_K) {
         const queryVec = await this.embeddings.embedQuery(userQuery);
-        console.log('\n[TRACE 1] userQuery:', userQuery);
-        console.log(`[TRACE 1] embedding: dim=${queryVec.length} | primeiros valores=[${queryVec.slice(0, 5).map(v => v.toFixed(6)).join(', ')}]`);
+        trace('\n[TRACE 1] userQuery:', userQuery);
+        trace(`[TRACE 1] embedding: dim=${queryVec.length} | primeiros valores=[${queryVec.slice(0, 5).map(v => v.toFixed(6)).join(', ')}]`);
         let filter = undefined;
         const anexoMatch = userQuery.match(/(?:Anexo)\s+([IVXLCDM]+(?:-[A-Z])?)/i);
         if (anexoMatch) {
             filter = { n1_header: anexoMatch[0].toUpperCase() };
         }
-        console.log('[TRACE 2] filter enviado para similaritySearchVectorWithScore:', JSON.stringify(filter ?? null));
-        const childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k, filter);
-        console.log(`\n[TRACE 3] ${childResults.length} child chunk(s) retornados:`);
-        childResults.forEach(([child, score], i) => {
-            console.log(`  [${i + 1}] score=${score.toFixed(6)}` +
-                ` | n1="${child.metadata.n1_header ?? ''}"` +
-                ` | n2="${child.metadata.n2_header ?? ''}"` +
-                ` | parentId=${child.metadata.parentId}` +
-                ` | preview="${child.pageContent.slice(0, 120).replace(/\n/g, ' ')}"`);
-        });
+        trace('[TRACE 2] filter enviado para similaritySearchVectorWithScore:', JSON.stringify(filter ?? null));
+        let childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k, filter);
+        if (filter && childResults.length === 0) {
+            trace('[TRACE 2b] Busca filtrada sem resultados — refazendo sem filtro');
+            childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k);
+        }
+        if (DEBUG_RAG) {
+            trace(`\n[TRACE 3] ${childResults.length} child chunk(s) retornados:`);
+            childResults.forEach(([child, score], i) => {
+                trace(`  [${i + 1}] score=${score.toFixed(6)}` +
+                    ` | n1="${child.metadata.n1_header ?? ''}"` +
+                    ` | n2="${child.metadata.n2_header ?? ''}"` +
+                    ` | parentId=${child.metadata.parentId}` +
+                    ` | preview="${child.pageContent.slice(0, 120).replace(/\n/g, ' ')}"`);
+            });
+        }
         const parentIds = new Set();
         const orderedParentIds = [];
-        const sourceDocIds = new Set();
         const scoreByParentId = new Map();
         for (const [child, score] of childResults) {
             const parentId = child.metadata.parentId;
-            const docId = child.metadata.documentId;
             if (parentId && !parentIds.has(parentId)) {
                 parentIds.add(parentId);
                 orderedParentIds.push(parentId);
             }
-            if (docId)
-                sourceDocIds.add(docId);
-            if (parentId)
-                scoreByParentId.set(parentId, score);
+            if (parentId) {
+                const prev = scoreByParentId.get(parentId);
+                if (prev === undefined || score < prev)
+                    scoreByParentId.set(parentId, score);
+            }
         }
-        console.log('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
-        orderedParentIds.forEach((pid, i) => console.log(`  ${i + 1} -> ${pid}`));
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
+            orderedParentIds.forEach((pid, i) => trace(`  ${i + 1} -> ${pid}`));
+        }
         const parentRows = await this.prisma.parentChunk.findMany({
             where: { id: { in: orderedParentIds } },
         });
@@ -402,6 +464,8 @@ let RagService = RagService_1 = class RagService {
             const prefixInfo = (0, hierarchical_context_1.deriveSiblingPrefix)(n2Header);
             if (!prefixInfo)
                 continue;
+            const parsedN2 = (0, legal_document_splitter_1.parseItemNumber)(n2Header);
+            const lastNumber = parsedN2.numbers[parsedN2.numbers.length - 1];
             const groupKey = `${row.document_id}|||${(0, hierarchical_context_1.getN1Header)(row)}|||${prefixInfo.parentPrefix}|||${prefixInfo.level}`;
             const score = scoreByParentId.get(row.id) ?? Infinity;
             const existingGroup = siblingExpansionGroups.get(groupKey);
@@ -414,11 +478,13 @@ let RagService = RagService_1 = class RagService {
                     level: prefixInfo.level,
                     bestScore: score,
                     retrievedIds: new Set([row.id]),
+                    retrievedLastNumbers: [lastNumber],
                 });
             }
             else {
                 existingGroup.retrievedIds.add(row.id);
                 existingGroup.bestScore = Math.min(existingGroup.bestScore, score);
+                existingGroup.retrievedLastNumbers.push(lastNumber);
             }
         }
         if (siblingExpansionGroups.size > 0) {
@@ -431,6 +497,7 @@ let RagService = RagService_1 = class RagService {
                         section_header: { startsWith: group.parentPrefix },
                     },
                 });
+                const validCandidates = [];
                 for (const candidate of candidates) {
                     if (group.retrievedIds.has(candidate.id))
                         continue;
@@ -442,8 +509,14 @@ let RagService = RagService_1 = class RagService {
                         continue;
                     if (!group.parentNumbers.every((value, idx) => parsedCandidate.numbers[idx] === value))
                         continue;
-                    siblingParents.push(candidate);
-                    scoreByParentId.set(candidate.id, group.bestScore);
+                    const candidateLast = parsedCandidate.numbers[parsedCandidate.numbers.length - 1];
+                    const distance = Math.min(...group.retrievedLastNumbers.map((n) => Math.abs(candidateLast - n)));
+                    validCandidates.push({ row: candidate, distance });
+                }
+                validCandidates.sort((a, b) => a.distance - b.distance);
+                for (const { row } of validCandidates.slice(0, MAX_SIBLINGS_PER_GROUP)) {
+                    siblingParents.push(row);
+                    scoreByParentId.set(row.id, group.bestScore);
                 }
             }
             if (siblingParents.length > 0) {
@@ -469,29 +542,48 @@ let RagService = RagService_1 = class RagService {
         const boostedClusters = (0, hierarchical_context_1.applyHierarchicalBoost)(clusters);
         const boostedParents = (0, hierarchical_context_1.flattenClusters)(boostedClusters);
         const parentsToUse = boostedParents.length ? boostedParents : orderedParentRows;
-        console.log('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
-        parentRows.forEach((row, i) => console.log(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`));
-        const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
-        console.log(`[TRACE 5] O Prisma preservou a ordem dos parentIds? ${prismaPreservedOrder ? 'SIM' : 'NAO'}`);
-        console.log('  (esperado):', orderedParentIds.join(' -> '));
-        console.log('  (recebido):', parentRows.map(r => r.id).join(' -> '));
-        const MARGEM_ANTES = 400;
-        const MARGEM_DEPOIS = 800;
+        const retrievedIdSet = new Set(orderedParentIds);
+        let primaryId = null;
+        let primaryBestScore = Infinity;
+        for (const row of parentsToUse) {
+            if (!retrievedIdSet.has(row.id))
+                continue;
+            const score = scoreByParentId.get(row.id) ?? Infinity;
+            if (score < primaryBestScore) {
+                primaryBestScore = score;
+                primaryId = row.id;
+            }
+        }
+        const orderedForPrompt = primaryId
+            ? [
+                ...parentsToUse.filter((row) => row.id === primaryId),
+                ...parentsToUse.filter((row) => row.id !== primaryId),
+            ]
+            : parentsToUse;
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
+            parentRows.forEach((row, i) => trace(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`));
+            const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
+            trace(`[TRACE 5] O Prisma preservou a ordem dos parentIds? ${prismaPreservedOrder ? 'SIM' : 'NAO'}`);
+            trace('  (esperado):', orderedParentIds.join(' -> '));
+            trace('  (recebido):', parentRows.map(r => r.id).join(' -> '));
+        }
         const triggeringChildByParentId = new Map();
         for (const [child] of childResults) {
             const pid = child.metadata.parentId;
             if (pid && !triggeringChildByParentId.has(pid))
                 triggeringChildByParentId.set(pid, child);
         }
-        const parents = parentsToUse.map((row) => {
+        const parents = orderedForPrompt.map((row) => {
             const triggeringChild = triggeringChildByParentId.get(row.id);
             let pageContent = row.content;
-            if (triggeringChild) {
-                const anchor = triggeringChild.pageContent.slice(0, 50).trim();
-                const startIndex = row.content.indexOf(anchor);
+            if (triggeringChild && row.content.length > SLIDING_WINDOW_MIN_PARENT_LENGTH) {
+                const startIndex = findAnchorIndex(row.content, triggeringChild.pageContent);
                 if (startIndex !== -1) {
-                    const windowStart = Math.max(0, startIndex - MARGEM_ANTES);
-                    const windowEnd = Math.min(row.content.length, startIndex + triggeringChild.pageContent.length + MARGEM_DEPOIS);
+                    let windowStart = Math.max(0, startIndex - SLIDING_WINDOW_BEFORE);
+                    let windowEnd = Math.min(row.content.length, startIndex + triggeringChild.pageContent.length + SLIDING_WINDOW_AFTER);
+                    windowStart = snapWindowStart(row.content, windowStart);
+                    windowEnd = snapWindowEnd(row.content, windowEnd);
                     const slice = row.content.substring(windowStart, windowEnd);
                     const prefix = windowStart > 0 ? '[...] ' : '';
                     const suffix = windowEnd < row.content.length ? ' [...]' : '';
@@ -507,17 +599,26 @@ let RagService = RagService_1 = class RagService {
                     n2_header: row.metadata?.n2_header ?? '',
                     sectionHeader: row.section_header,
                     parentId: row.id,
+                    ...(primaryId
+                        ? { role: row.id === primaryId ? 'PRINCIPAL' : 'COMPLEMENTAR' }
+                        : {}),
                 },
             });
         });
-        console.log('\n[TRACE 6] Ordem final dos ParentChunks enviados ao LLM:');
-        parents.forEach((doc, i) => console.log(`  [Documento Ref ${i + 1}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`));
-        return { parents, sourceDocIds: Array.from(sourceDocIds) };
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 6] Ordem final dos ParentChunks enviados ao LLM:');
+            parents.forEach((doc, i) => trace(`  [Fonte ${i + 1}${doc.metadata.role ? ` — ${doc.metadata.role}` : ''}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`));
+        }
+        const sourceDocIds = Array.from(new Set(parents
+            .map((doc) => doc.metadata.documentId)
+            .filter((id) => Boolean(id))));
+        return { parents, sourceDocIds };
     }
     async query(userQuery, conversationId) {
-        const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery, 5);
+        const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery);
         const prompt = buildRagPrompt(parents, userQuery);
         let aiResponse = '';
+        let llmFailed = false;
         try {
             const response = await this.llm.invoke(prompt);
             if (typeof response.content === 'string') {
@@ -527,17 +628,20 @@ let RagService = RagService_1 = class RagService {
                 const textPart = response.content.find((p) => p.type === 'text');
                 aiResponse = textPart && 'text' in textPart ? textPart.text : '';
             }
-            const finishReason = response.response_metadata?.finish_reason ??
-                response.generationInfo?.finish_reason ??
-                'unknown';
+            const finishReason = resolveFinishReason(response);
             if (finishReason && finishReason !== 'STOP') {
                 this.logger.warn(`[LLM] finishReason inesperado: ${finishReason}`);
             }
         }
         catch (err) {
+            llmFailed = true;
             this.logger.error(`[LLM] Falha em llm.invoke — status=${err?.status ?? err?.code ?? 'n/a'} | message=${err?.message ?? String(err)}`);
         }
-        if (!aiResponse.trim()) {
+        if (llmFailed) {
+            aiResponse =
+                'Nao foi possivel gerar a resposta neste momento devido a uma falha tecnica na comunicacao com o modelo. Tente novamente em alguns instantes.';
+        }
+        else if (!aiResponse.trim()) {
             aiResponse =
                 'As informacoes disponiveis nos documentos indexados nao sao suficientes para responder a esta pergunta com precisao.';
         }

@@ -65,7 +65,7 @@ describe('hierarchical-context', () => {
     expect(clusters[2].documentId).toBe('doc-2');
   });
 
-  test('applyHierarchicalBoost privilegia clusters com mais hits mantendo estabilidade de ordem', () => {
+  test('applyHierarchicalBoost prioriza hitCount e desempata pelo melhor score vetorial', () => {
     const clusters = [
       { documentId: 'doc-1', n1Header: 'ANEXO I', parents: [], hitCount: 1, bestScore: 0.3 },
       { documentId: 'doc-1', n1Header: 'ANEXO II', parents: [], hitCount: 2, bestScore: 0.2 },
@@ -74,9 +74,23 @@ describe('hierarchical-context', () => {
 
     const boosted = applyHierarchicalBoost(clusters);
 
-    expect(boosted[0].n1Header).toBe('ANEXO II');
-    expect(boosted[1].n1Header).toBe('ANEXO III');
+    // Empate em hitCount (ANEXO II e III): vence o de melhor score (menor
+    // distancia). ANEXO I, com menos hits, fica por ultimo.
+    expect(boosted[0].n1Header).toBe('ANEXO III');
+    expect(boosted[1].n1Header).toBe('ANEXO II');
     expect(boosted[2].n1Header).toBe('ANEXO I');
+  });
+
+  test('applyHierarchicalBoost preserva ordem de insercao em empate total', () => {
+    const clusters = [
+      { documentId: 'doc-1', n1Header: 'ANEXO A', parents: [], hitCount: 1, bestScore: 0.2 },
+      { documentId: 'doc-1', n1Header: 'ANEXO B', parents: [], hitCount: 1, bestScore: 0.2 },
+    ];
+
+    const boosted = applyHierarchicalBoost(clusters);
+
+    expect(boosted[0].n1Header).toBe('ANEXO A');
+    expect(boosted[1].n1Header).toBe('ANEXO B');
   });
 
   test('deriveSiblingPrefix retorna prefixo de irmãos e nível correto', () => {
@@ -153,17 +167,20 @@ describe('hierarchical-context', () => {
     expect(flattened).toHaveLength(2);
   });
 
-  test('buildRagPrompt adiciona instrucoes de contexto relacionado quando ha mesmo n1_header', () => {
+  test('buildRagPrompt anota a origem estrutural dos trechos e pede fontes ao final', () => {
     const contexts = [
-      new Document({ pageContent: 'Trecho 1', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.1.' } }),
-      new Document({ pageContent: 'Trecho 2', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.2.' } }),
+      new Document({ pageContent: 'Conteudo do item 10.1', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.1.' } }),
+      new Document({ pageContent: 'Conteudo do item 10.2', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.2.' } }),
     ];
 
     const prompt = buildRagPrompt(contexts, 'O que diz o Anexo I?');
 
-    expect(prompt).toContain('SINTESE DE CONTEXTO RELACIONADO');
-    expect(prompt).toContain('sintetize as informacoes complementares');
-    expect(prompt).toContain('preserve a origem de cada informacao indicando o item correspondente');
+    // Cada trecho carrega sua identidade estrutural (base das citacoes finais)
+    expect(prompt).toContain('[Trecho 1] Documento: "Documento A" | ANEXO I | Item 10.1.');
+    expect(prompt).toContain('[Trecho 2] Documento: "Documento A" | ANEXO I | Item 10.2.');
+    // A prioridade e comunicada pela ordem, e as referencias vao ao final
+    expect(prompt).toContain('ordenados por pertinencia');
+    expect(prompt).toContain('Fontes:');
   });
 
   test('MAX_NEIGHBOR_DISTANCE e um numero positivo e usado para ordenar proximidade', () => {
