@@ -559,11 +559,22 @@ describe('buildRagPrompt', () => {
     expect(prompt).toContain('nao copie secoes inteiras da norma');
   });
 
-  test('sinaliza ordenacao por pertinencia e exige fontes apenas ao final', () => {
+  test('sinaliza ordenacao por pertinencia e cita a fonte inline, sem bloco terminal de fontes', () => {
     expect(prompt).toContain('ordenados por pertinencia');
-    expect(prompt).toContain('FONTES AO FINAL');
-    expect(prompt).toContain('Fontes:');
-    expect(prompt).toContain('Nao numere as fontes nem use rotulos internos');
+    expect(prompt).toContain('CITACAO DA FONTE');
+    expect(prompt).toContain('identifique o dispositivo de origem no proprio subtitulo');
+    // O bloco terminal "Fontes:" foi substituido por citacao inline por secao
+    expect(prompt).not.toContain('FONTES AO FINAL');
+  });
+
+  test('exige estrutura com subtitulos, cobertura completa e citacao inline', () => {
+    expect(prompt).toContain('ESTRUTURA E FORMATO');
+    expect(prompt).toContain('###');
+    expect(prompt).toContain('COBERTURA COMPLETA');
+  });
+
+  test('instrui a sinalizar subitem referido cujo texto nao consta dos trechos', () => {
+    expect(prompt).toContain('nao consta dos trechos');
   });
 });
 

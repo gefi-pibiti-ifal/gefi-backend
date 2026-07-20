@@ -27,16 +27,23 @@ import type { Prisma } from '@prisma/client';
 // Constantes de expansão hierárquica
 // ---------------------------------------------------------------------------
 
-/** Número máximo de ParentChunks enviados ao LLM após expansão. */
-export const MAX_EXPANDED_PARENTS = 8;
+/**
+ * Número máximo de ParentChunks enviados ao LLM após expansão.
+ * Elevado de 8 para 14 com a expansão descendente: um dispositivo enumerado
+ * (caput + subitens 10.2.1..N) somado ao Item 9 e a poucos irmãos já passava
+ * de 8, e o flatten cortava justamente a cauda dos subitens — reintroduzindo
+ * a resposta incompleta que a expansão busca resolver.
+ */
+export const MAX_EXPANDED_PARENTS = 14;
 
 /**
  * Limite total de caracteres do contexto enviado ao LLM.
- * Com parents integros (janela deslizante so acima de 3500 chars) e
- * RETRIEVAL_FETCH_K=12, 12k passou a cortar parents relevantes no flatten.
- * 24k chars (~6k tokens) segue trivial para o contexto do gemini-2.5-flash.
+ * Com parents integros (janela deslizante so acima de 3500 chars) e a expansão
+ * descendente trazendo os filhos do dispositivo, 24k voltou a cortar subitens
+ * no flatten. 40k chars (~10k tokens) segue trivial para a janela de 1M do
+ * gemini-2.5-flash.
  */
-export const MAX_EXPANDED_CHARS = 24_000;
+export const MAX_EXPANDED_CHARS = 40_000;
 
 /**
  * Distância máxima (em posição de inserção no banco) entre o top parent

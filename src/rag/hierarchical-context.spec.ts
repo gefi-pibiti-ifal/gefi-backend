@@ -167,7 +167,7 @@ describe('hierarchical-context', () => {
     expect(flattened).toHaveLength(2);
   });
 
-  test('buildRagPrompt anota a origem estrutural dos trechos e pede fontes ao final', () => {
+  test('buildRagPrompt anota a origem estrutural dos trechos e cita a fonte inline', () => {
     const contexts = [
       new Document({ pageContent: 'Conteudo do item 10.1', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.1.' } }),
       new Document({ pageContent: 'Conteudo do item 10.2', metadata: { documentId: 'doc-1', title: 'Documento A', n1_header: 'ANEXO I', n2_header: '10.2.' } }),
@@ -175,12 +175,12 @@ describe('hierarchical-context', () => {
 
     const prompt = buildRagPrompt(contexts, 'O que diz o Anexo I?');
 
-    // Cada trecho carrega sua identidade estrutural (base das citacoes finais)
+    // Cada trecho carrega sua identidade estrutural (base das citacoes por secao)
     expect(prompt).toContain('[Trecho 1] Documento: "Documento A" | ANEXO I | Item 10.1.');
     expect(prompt).toContain('[Trecho 2] Documento: "Documento A" | ANEXO I | Item 10.2.');
-    // A prioridade e comunicada pela ordem, e as referencias vao ao final
+    // A prioridade e comunicada pela ordem; a fonte e citada inline por secao
     expect(prompt).toContain('ordenados por pertinencia');
-    expect(prompt).toContain('Fontes:');
+    expect(prompt).toContain('CITACAO DA FONTE');
   });
 
   test('MAX_NEIGHBOR_DISTANCE e um numero positivo e usado para ordenar proximidade', () => {

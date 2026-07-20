@@ -52,6 +52,12 @@ const RETRIEVAL_FETCH_K = 12;
 // muitos irmaos inunda o orcamento de contexto e expulsa parents relevantes
 // de outros grupos.
 const MAX_SIBLINGS_PER_GROUP = 3;
+// Teto de filhos diretos trazidos por item recuperado na expansao DESCENDENTE.
+// Um item nao-folha ("10.2") costuma guardar so o caput; os subitens que
+// compoem a resposta ("10.2.1", "10.2.2", ...) vivem em parents-filhos e
+// precisam ser trazidos para o dispositivo chegar completo ao prompt. O teto
+// evita que um dispositivo com dezenas de subitens monopolize o contexto.
+const MAX_DESCENDANTS_PER_ITEM = 12;
 
 // Filtro de qualidade dos ParentChunks
 const MIN_PARENT_CONTENT_LENGTH = 80;
@@ -353,7 +359,7 @@ export function buildRagPrompt(contexts: Document[], userQuery: string): string 
 
   return `Voce e um assistente especializado em normas e documentos administrativos brasileiros. Quem pergunta e um servidor publico que precisa de uma resposta clara, correta e util para aplicar a norma no dia a dia.
 
-Abaixo estao trechos de documentos normativos, cada um com uma anotacao interna de origem (documento, anexo, item). Os trechos estao ordenados por pertinencia — o primeiro e o mais diretamente relacionado a pergunta. As anotacoes, os rotulos [Trecho N] e o mecanismo de selecao de trechos sao detalhes internos do sistema e nao fazem parte da resposta.
+Abaixo estao trechos de documentos normativos, cada um com uma anotacao interna de origem (documento, anexo, item). Os trechos estao ordenados por pertinencia — o primeiro e o mais diretamente relacionado a pergunta —, mas todos os trechos fornecidos sao pertinentes: a posicao na lista nao torna nenhum deles dispensavel. Trechos consecutivos de um mesmo documento e anexo costumam ser partes (itens, subitens, alineas ou incisos) de um mesmo dispositivo; nesse caso formam uma sequencia continua, na ordem original da norma, e devem ser lidos em conjunto, pois juntos compoem a resposta completa. As anotacoes, os rotulos [Trecho N] e o mecanismo de selecao de trechos sao detalhes internos do sistema e nao fazem parte da resposta.
 
 COMO RESPONDER:
 
@@ -365,6 +371,7 @@ COMO RESPONDER:
 2. ESCOLHA O MODO PELO TIPO DE PERGUNTA
    a) Pergunta explicativa ("quais sao...", "como funciona...", "o que deve...", "quando..."):
       - responda de forma direta e organizada, sintetizando com fidelidade o que a norma determina;
+      - quando a pergunta pedir um conjunto de elementos (rotinas, obrigacoes, requisitos, hipoteses, etapas, prazos ou documentos), enumere TODOS os itens presentes nos trechos que pertencam ao dispositivo perguntado, sem omitir nenhum: sintetize a redacao de cada item, mas nunca reduza a quantidade de itens da lista;
       - use topicos quando facilitarem a leitura;
       - preserve com exatidao numeros, prazos, valores, percentuais, obrigacoes e a numeracao dos dispositivos, citando-a de forma natural no texto (ex: "conforme o item 10.2.1 do Anexo VIII-B");
       - transcreva literalmente apenas passagens curtas em que a redacao exata importa;
@@ -374,20 +381,34 @@ COMO RESPONDER:
       - mantenha a numeracao e a estrutura originais (itens, subitens, alineas, incisos);
       - nao resuma, nao reorganize, nao omita e nao acrescente nada.
 
-3. FIDELIDADE AO TEXTO NORMATIVO
+3. ESTRUTURA E FORMATO (perguntas explicativas)
+   Organize a resposta para leitura rapida, como um bom resumo executivo — nem transcricao crua, nem um unico paragrafo denso:
+   - Abra com uma frase curta que situa a resposta, nomeando o documento e o anexo ou capitulo (use o titulo tal como aparece na anotacao de origem, sem inventar dados) e destacando em **negrito** o tema perguntado. Ex: "No ANEXO VIII-B da IN05, as rotinas de **fiscalizacao mensal** compreendem:".
+   - Agrupe o conteudo por tema em secoes. Cada secao recebe um subtitulo de terceiro nivel em markdown (###), numerado, terminando com o dispositivo de origem daquela secao entre parenteses. Ex: "### 1. Verificacao de dispendios e relatorio mensal (Item 9)".
+   - Dentro de cada secao use topicos; comece cada topico com um rotulo curto em **negrito** que resume o ponto, seguido de dois-pontos e da explicacao fiel a norma.
+   - Preserve numeros, prazos, percentuais e termos juridicos exatamente como no texto normativo.
+   - Adapte a profundidade a pergunta: uma resposta simples ou de um unico dispositivo dispensa subtitulos — responda em um paragrafo direto ou em poucos topicos, citando o dispositivo no proprio texto.
+   - Quando for util, encerre com uma unica linha oferecendo um proximo passo concreto (ex: consolidar um checklist das rotinas). Esse convite e opcional e breve.
+
+4. COBERTURA COMPLETA DA RESPOSTA
+   Contemple todos os elementos pertinentes presentes nos trechos, nao apenas os primeiros ou os mais evidentes.
+   Quando varios trechos consecutivos tratam do mesmo dispositivo (subitens, alineas, incisos), percorra-os do primeiro ao ultimo e inclua cada parte pertinente — o fim da lista importa tanto quanto o inicio.
+   Nao condense itens distintos em um so nem substitua a lista por uma descricao generica ("entre outras rotinas", "diversos procedimentos"): cada item pertinente deve aparecer.
+   Antes de encerrar, releia os trechos fornecidos e confirme que nenhum item pertinente do dispositivo perguntado ficou de fora.
+
+5. FIDELIDADE AO TEXTO NORMATIVO
    Use somente o conteudo dos trechos fornecidos; nao use conhecimento externo.
    Nao invente dispositivos, numeros ou continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
+   Se um dispositivo mencionado nos trechos remeter a um subitem, alinea ou inciso cujo texto NAO esta presente, registre a ausencia em uma nota curta entre parenteses (ex: "(a alinea 'b.1' e referida, mas seu texto nao consta dos trechos disponiveis)") — nunca invente o conteudo ausente nem descarte a referencia em silencio.
    Nao faca interpretacao juridica, recomendacao ou opiniao alem do que a norma diz.
    Se os trechos nao contiverem a informacao perguntada, responda EXATAMENTE:
    "As informacoes disponiveis nao sao suficientes."
 
-4. FONTES AO FINAL
-   Encerre a resposta com um bloco de referencias, uma por linha:
-
-   Fontes:
-   - <titulo do documento> — <anexo ou capitulo, se houver> — <item ou artigo>
-
-   Liste apenas os dispositivos efetivamente usados na resposta. Nao numere as fontes nem use rotulos internos.
+6. CITACAO DA FONTE
+   Torne a origem de cada parte rastreavel, sem usar rotulos internos do sistema (nunca escreva "Trecho N", "Fonte N", "PRINCIPAL" ou "COMPLEMENTAR"):
+   - Em respostas com secoes, identifique o dispositivo de origem no proprio subtitulo, entre parenteses — ex: "(Item 10.2)", "(Item 2.1, alinea 'b')", "(Art. 66-A)".
+   - Em respostas curtas, cite o dispositivo naturalmente no texto — ex: "conforme o item 9 do Anexo VIII-B".
+   - Cite apenas dispositivos efetivamente usados na resposta e reproduza exatamente a numeracao que aparece nos trechos.
 
 --- TRECHOS DOS DOCUMENTOS (uso interno) ---
 ${contextBlock}
@@ -427,6 +448,13 @@ export class RagService implements OnModuleInit {
       // longos nao pode ser cortada pelo limite default — corte no meio da
       // lista forca o modelo a "fechar resumindo".
       maxOutputTokens: 8192,
+      // gemini-2.5-flash habilita "thinking" dinamico por padrao, e os tokens
+      // de raciocinio disputam o mesmo orcamento de maxOutputTokens. Sem limite,
+      // uma pergunta enumerativa longa pode gastar o orcamento pensando e a
+      // resposta terminar cortada (finishReason=MAX_TOKENS). Um teto modesto de
+      // thinking preserva raciocinio suficiente para a checagem de cobertura e
+      // garante folga para a resposta final.
+      thinkingConfig: { thinkingBudget: 2048 },
       safetySettings: [
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -692,9 +720,8 @@ export class RagService implements OnModuleInit {
       }
     }
 
+    const siblingParents: ParentChunkRow[] = [];
     if (siblingExpansionGroups.size > 0) {
-      const siblingParents: ParentChunkRow[] = [];
-
       for (const group of siblingExpansionGroups.values()) {
         const candidates = await this.prisma.parentChunk.findMany({
           where: {
@@ -732,30 +759,91 @@ export class RagService implements OnModuleInit {
           scoreByParentId.set(row.id, group.bestScore);
         }
       }
+    }
 
-      if (siblingParents.length > 0) {
-        const parentsByGroup = new Map<string, ParentChunkRow[]>();
-        const groupOrder: string[] = [];
+    // -----------------------------------------------------------------------
+    // Expansao DESCENDENTE — filhos diretos do item recuperado
+    //
+    // A expansao de irmaos acima so alcanca itens do MESMO nivel (10.2 -> 10.1,
+    // 10.3) — ela rejeita candidatos de nivel diferente. Mas um item nao-folha
+    // como "10.2" costuma conter apenas o caput; os subitens que de fato
+    // compoem a resposta ("10.2.1", "10.2.2", ...) vivem em parents-filhos
+    // separados, de nivel mais profundo. Sem esta passagem o retriever traz o
+    // TITULO do dispositivo mas nao o seu conteudo enumerado, e a resposta sai
+    // incompleta mesmo com o contexto "certo" recuperado. Aqui buscamos os
+    // filhos DIRETOS de cada item efetivamente recuperado.
+    // -----------------------------------------------------------------------
+    const descendantParents: ParentChunkRow[] = [];
+    const alreadySelectedIds = new Set<string>([
+      ...orderedParentRows.map((row) => row.id),
+      ...siblingParents.map((row) => row.id),
+    ]);
 
-        const appendParent = (parent: ParentChunkRow) => {
-          const key = `${parent.document_id}|||${getN1Header(parent)}`;
-          if (!parentsByGroup.has(key)) {
-            parentsByGroup.set(key, []);
-            groupOrder.push(key);
-          }
-          const groupRows = parentsByGroup.get(key)!;
-          if (!groupRows.some((row) => row.id === parent.id)) {
-            groupRows.push(parent);
-          }
-        };
+    for (const row of orderedParentRows) {
+      const parsedSelf = parseItemNumber(getN2Header(row));
+      if (!parsedSelf) continue;
 
-        orderedParentRows.forEach(appendParent);
-        siblingParents.forEach(appendParent);
+      const childPrefix = `${parsedSelf.numbers.join('.')}.`; // "10.2." -> filhos "10.2.x"
+      const childLevel  = parsedSelf.level + 1;
 
-        orderedParentRows = groupOrder.flatMap((key) =>
-          sortParentsByStructuralOrder(parentsByGroup.get(key)!),
-        );
+      const children = await this.prisma.parentChunk.findMany({
+        where: {
+          document_id: row.document_id,
+          metadata: { path: ['n1_header'], equals: getN1Header(row) },
+          section_header: { startsWith: childPrefix },
+        },
+      });
+
+      const directChildren: ParentChunkRow[] = [];
+      for (const child of children) {
+        if (alreadySelectedIds.has(child.id)) continue;
+        if (child.content.length < MIN_PARENT_CONTENT_LENGTH) continue;
+
+        const parsedChild = parseItemNumber(getN2Header(child));
+        // Apenas filhos DIRETOS: um nivel abaixo e com o prefixo numerico do
+        // item batendo exatamente (exclui netos e vizinhos como "10.20").
+        if (!parsedChild || parsedChild.level !== childLevel) continue;
+        if (!parsedSelf.numbers.every((value, idx) => parsedChild.numbers[idx] === value)) continue;
+
+        directChildren.push(child);
       }
+
+      // Herda o score do pai: os filhos completam o MESMO dispositivo e nao
+      // devem afundar na priorizacao por nao terem hit vetorial proprio.
+      const inheritedScore = scoreByParentId.get(row.id) ?? Infinity;
+      for (const child of sortParentsByStructuralOrder(directChildren).slice(0, MAX_DESCENDANTS_PER_ITEM)) {
+        descendantParents.push(child);
+        alreadySelectedIds.add(child.id);
+        scoreByParentId.set(child.id, inheritedScore);
+      }
+    }
+
+    if (siblingParents.length > 0 || descendantParents.length > 0) {
+      const parentsByGroup = new Map<string, ParentChunkRow[]>();
+      const groupOrder: string[] = [];
+
+      const appendParent = (parent: ParentChunkRow) => {
+        const key = `${parent.document_id}|||${getN1Header(parent)}`;
+        if (!parentsByGroup.has(key)) {
+          parentsByGroup.set(key, []);
+          groupOrder.push(key);
+        }
+        const groupRows = parentsByGroup.get(key)!;
+        if (!groupRows.some((row) => row.id === parent.id)) {
+          groupRows.push(parent);
+        }
+      };
+
+      orderedParentRows.forEach(appendParent);
+      siblingParents.forEach(appendParent);
+      descendantParents.forEach(appendParent);
+
+      // Ordenacao estrutural dentro do grupo garante caput antes dos filhos e
+      // filhos em ordem (10.2 -> 10.2.1 -> 10.2.2), reconstituindo a leitura
+      // continua do dispositivo.
+      orderedParentRows = groupOrder.flatMap((key) =>
+        sortParentsByStructuralOrder(parentsByGroup.get(key)!),
+      );
     }
 
     const clusters = buildClusters(orderedParentRows, scoreByParentId);
@@ -884,6 +972,7 @@ export class RagService implements OnModuleInit {
 
     let aiResponse = '';
     let llmFailed  = false;
+    let truncated  = false;
     try {
       const response = await this.llm.invoke(prompt);
 
@@ -895,7 +984,13 @@ export class RagService implements OnModuleInit {
       }
 
       const finishReason = resolveFinishReason(response);
-      if (finishReason && finishReason !== 'STOP') {
+      if (finishReason === 'MAX_TOKENS') {
+        // Corte por limite de tokens: a resposta pode ter parado no meio de uma
+        // enumeracao. Sinalizamos ao usuario em vez de entregar um texto
+        // truncado como se estivesse completo (perda de fidelidade silenciosa).
+        truncated = true;
+        this.logger.error('[LLM] Resposta truncada por limite de tokens (MAX_TOKENS) — saida possivelmente incompleta.');
+      } else if (finishReason && finishReason !== 'STOP') {
         this.logger.warn(`[LLM] finishReason inesperado: ${finishReason}`);
       }
     } catch (err: any) {
@@ -914,6 +1009,11 @@ export class RagService implements OnModuleInit {
     } else if (!aiResponse.trim()) {
       aiResponse =
         'As informacoes disponiveis nos documentos indexados nao sao suficientes para responder a esta pergunta com precisao.';
+    } else if (truncated) {
+      // Resposta valida porem cortada por limite de tamanho: acrescenta um
+      // aviso discreto para nao passar por completa.
+      aiResponse +=
+        '\n\n(Observacao do sistema: esta resposta pode ter sido interrompida por limite de tamanho e talvez nao cubra todos os itens. Refaca a pergunta de forma mais especifica para obter o restante.)';
     }
 
     const sourcesMap = new Map<string, { id: string; title: string }>();
