@@ -58,6 +58,25 @@ export const HIERARCHICAL_BOOST_ENABLED = true;
 /** Quando true, a expansão só busca vizinhos do mesmo documento. */
 export const EXPAND_ONLY_SAME_DOCUMENT = true;
 
+/**
+ * Coerência de anexo — precisão entre processos administrativos.
+ *
+ * Um dispositivo pode ter texto quase idêntico ao de outro anexo do mesmo
+ * documento (ex.: o "recebimento provisório" do fiscal técnico no ANEXO V-B
+ * espelha o do fiscal administrativo no ANEXO VIII-B). Numa consulta ampla, sem
+ * filtro de anexo, a busca vetorial traz os dois e o anexo estranho contamina a
+ * resposta com um dispositivo de OUTRO processo.
+ *
+ * MIN_DOMINANT_SCOPE_HITS: só podamos quando existe um anexo claramente
+ *   dominante — com pelo menos este número de hits do retriever. Abaixo disso a
+ *   recuperação é ambígua e nada é removido.
+ * MIN_FOREIGN_ANEXO_HITS: um anexo diferente do dominante, no MESMO documento,
+ *   só permanece se tiver ao menos esta corroboração (hits do retriever). Um
+ *   único hit isolado é tratado como boilerplate paralelo e removido.
+ */
+export const MIN_DOMINANT_SCOPE_HITS = 2;
+export const MIN_FOREIGN_ANEXO_HITS  = 2;
+
 // ---------------------------------------------------------------------------
 // Tipos
 // ---------------------------------------------------------------------------
@@ -215,6 +234,104 @@ export function applyHierarchicalBoost(clusters: RetrievalCluster[]): RetrievalC
     if (a.bestScore !== b.bestScore) return a.bestScore - b.bestScore;
     return 0; // estável: preserva ordem de inserção
   });
+}
+
+// ---------------------------------------------------------------------------
+// pruneForeignAnexoContamination
+//
+// Remove dispositivos de um anexo "estranho" que contaminam uma resposta cujo
+// processo administrativo vive em outro anexo do MESMO documento.
+//
+// O sinal decisivo é a contagem de hits do RETRIEVER (pré-expansão) por escopo
+// (documento + n1_header): o processo que a pergunta realmente trata acumula
+// vários hits (ex.: ANEXO VIII-B com Itens 9 e 10.2), enquanto uma duplicata
+// paralela de outro anexo entra com um único hit (ex.: ANEXO V-B, Item 4). A
+// contagem pós-expansão NAO serve — a expansão de irmãos/filhos infla ambos.
+//
+// Regras (conservadoras, para nunca podar recuperação legítima):
+//   - só age quando ha um escopo dominante com >= MIN_DOMINANT_SCOPE_HITS;
+//   - só remove escopos do MESMO documento e anexo DIFERENTE do dominante;
+//   - preserva anexos estrangeiros corroborados (>= MIN_FOREIGN_ANEXO_HITS) e
+//     qualquer conteudo de OUTROS documentos (respostas multi-norma legitimas).
+//
+// `retrievedScopeHits`: mapa `${document_id}|||${n1_header}` -> nº de parents
+//   efetivamente recuperados pelo vetor naquele escopo (nao expandidos).
+// ---------------------------------------------------------------------------
+export function pruneForeignAnexoContamination(
+  parents:            ParentChunkRow[],
+  retrievedScopeHits: Map<string, number>,
+): ParentChunkRow[] {
+  if (retrievedScopeHits.size <= 1) return parents;
+
+  let dominantScope = '';
+  let dominantHits  = -1;
+  for (const [scope, hits] of retrievedScopeHits) {
+    if (hits > dominantHits) { dominantHits = hits; dominantScope = scope; }
+  }
+  if (dominantHits < MIN_DOMINANT_SCOPE_HITS) return parents;
+
+  const sep          = dominantScope.lastIndexOf('|||');
+  const dominantDoc  = dominantScope.slice(0, sep);
+  const dominantN1   = dominantScope.slice(sep + 3);
+
+  return parents.filter((row) => {
+    const n1 = getN1Header(row);
+    const sameDocForeignAnexo = row.document_id === dominantDoc && n1 !== dominantN1;
+    if (!sameDocForeignAnexo) return true; // dominante e outros documentos permanecem
+    const hits = retrievedScopeHits.get(`${row.document_id}|||${n1}`) ?? 0;
+    return hits >= MIN_FOREIGN_ANEXO_HITS;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Selecao por PROVENIENCIA (precisao pos-recuperacao, deterministica)
+//
+// Cada dispositivo do conjunto candidato carrega COMO entrou nele:
+//   HIT        — acerto direto da busca vetorial (casou com o tema perguntado);
+//   DESCENDANT — filho de um hit; completa o MESMO dispositivo (ex.: 10.2.1 sob
+//                10.2) -> central;
+//   SIBLING    — irmao trazido pela expansao (vizinho numerico do hit, ex.:
+//                10.4/10.5 ao lado de 10.2); provavelmente OUTRO dispositivo,
+//                modalidade ou variante -> apoio.
+//
+// Politica: e CENTRAL (PRINCIPAL) quem tem HIT ou DESCENDANT; e COMPLEMENTAR
+// quem entrou APENAS por SIBLING. Nada e removido — so a prioridade muda, com os
+// centrais a frente (ordem estavel). Substitui o antigo criterio por score.
+//
+// Limite conhecido: nao distingue papeis ORTOGONAIS a estrutura — um hit direto
+// que e excecao/variante (ex.: "comunicar em caso de irregularidade") e
+// estruturalmente identico a um hit central e permanece PRINCIPAL. Esse residuo
+// semantico so uma camada de intencao (LLM/classificador) resolve.
+// ---------------------------------------------------------------------------
+export type Provenance = 'HIT' | 'DESCENDANT' | 'SIBLING';
+
+export interface RankedParent {
+  row:        ParentChunkRow;
+  role:       'PRINCIPAL' | 'COMPLEMENTAR';
+  provenance: Provenance[];
+}
+
+export function rankByProvenance(
+  parents:        ParentChunkRow[],
+  provenanceById: Map<string, Set<Provenance>>,
+): RankedParent[] {
+  const classified: RankedParent[] = parents.map((row) => {
+    const prov = provenanceById.get(row.id);
+    // Sem proveniencia conhecida: conservador — mantem como central (nao rebaixa
+    // o que nao conseguimos explicar, preservando recall).
+    const isCentral = !prov || prov.has('HIT') || prov.has('DESCENDANT');
+    return {
+      row,
+      role: (isCentral ? 'PRINCIPAL' : 'COMPLEMENTAR') as RankedParent['role'],
+      provenance: prov ? [...prov] : [],
+    };
+  });
+
+  // Estavel: centrais primeiro (preservando a ordem estrutural), apoio depois.
+  return [
+    ...classified.filter((c) => c.role === 'PRINCIPAL'),
+    ...classified.filter((c) => c.role === 'COMPLEMENTAR'),
+  ];
 }
 
 // ---------------------------------------------------------------------------

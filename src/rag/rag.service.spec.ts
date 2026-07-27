@@ -5,6 +5,7 @@ import {
   snapWindowEnd,
   buildRagPrompt,
   buildSourceLabel,
+  buildChunkEmbedText,
   stripInvisibleArtifacts,
   dehyphenateAttested,
 } from './rag.service';
@@ -447,6 +448,31 @@ function makeDoc(metadata: Record<string, unknown>, pageContent = 'Conteudo do i
   return new Document({ pageContent, metadata });
 }
 
+describe('buildChunkEmbedText', () => {
+  test('prepende contexto estrutural ao conteudo cru, separado por linha em branco', () => {
+    const out = buildChunkEmbedText('a contratada devera entregar as certidoes...', {
+      title: 'IN05',
+      sectionHeading: 'ANEXO VIII-B Diretrizes para a fiscalizacao dos contratos',
+      item: '2.1.',
+    });
+    expect(out).toBe(
+      'IN05 — ANEXO VIII-B Diretrizes para a fiscalizacao dos contratos — Item 2.1.\n\na contratada devera entregar as certidoes...',
+    );
+    // o tema da secao ("fiscalizacao") passa a fazer parte do texto vetorizado
+    expect(out).toContain('fiscalizacao');
+  });
+
+  test('o conteudo cru permanece integro apos o cabecalho (armazenamento inalterado)', () => {
+    const raw = '10.2. Antes do pagamento, o fiscal deve consultar o SICAF.';
+    const out = buildChunkEmbedText(raw, { title: 'IN05', sectionHeading: 'ANEXO VIII-B', item: '10.2.' });
+    expect(out.endsWith(raw)).toBe(true);
+  });
+
+  test('sem contexto disponivel, retorna o conteudo cru sem prefixo', () => {
+    expect(buildChunkEmbedText('texto cru', {})).toBe('texto cru');
+  });
+});
+
 describe('buildSourceLabel', () => {
   test('rotulo completo: titulo + anexo + item', () => {
     const doc = makeDoc({
@@ -559,18 +585,63 @@ describe('buildRagPrompt', () => {
     expect(prompt).toContain('nao copie secoes inteiras da norma');
   });
 
-  test('sinaliza ordenacao por pertinencia e cita a fonte inline, sem bloco terminal de fontes', () => {
+  test('sinaliza ordenacao por pertinencia e cita a fonte no titulo do topico', () => {
     expect(prompt).toContain('ordenados por pertinencia');
     expect(prompt).toContain('CITACAO DA FONTE');
-    expect(prompt).toContain('identifique o dispositivo de origem no proprio subtitulo');
-    // O bloco terminal "Fontes:" foi substituido por citacao inline por secao
+    // A origem vai entre parenteses no titulo, nunca num bloco de metadados
+    expect(prompt).toContain('entre parenteses no TITULO');
     expect(prompt).not.toContain('FONTES AO FINAL');
   });
 
-  test('exige estrutura com subtitulos, cobertura completa e citacao inline', () => {
+  test('instrui a selecionar dispositivos por processo, nao por tema (recuperacao != resposta)', () => {
+    expect(prompt).toContain('PENSE EM PROCESSO, NAO EM DISPOSITIVOS');
+    expect(prompt).toContain('universo de CANDIDATOS');
+    // eixo de precisao (remover correlato) e de recall (etapa indispensavel)
+    expect(prompt).toContain('etapa indispensavel');
+    expect(prompt).toContain('COBERTURA COMPLETA DOS DISPOSITIVOS SELECIONADOS');
+  });
+
+  test('exige um topico por dispositivo, titulado pela finalidade, sem categorias inventadas', () => {
     expect(prompt).toContain('ESTRUTURA E FORMATO');
-    expect(prompt).toContain('###');
+    expect(prompt).toContain('um dispositivo por topico');
+    // proibe titulos-fase / categorias inventadas pelo modelo
+    expect(prompt).toContain('PROIBIDO transformar dispositivos em fases');
     expect(prompt).toContain('COBERTURA COMPLETA');
+  });
+
+  test('proibe fusao/absorcao entre dispositivos e conta apenas os selecionados', () => {
+    // a unidade de organizacao e o dispositivo, nunca o tema
+    expect(prompt).toContain('UM DISPOSITIVO = UM BLOCO');
+    expect(prompt).toContain('a afinidade tematica nunca autoriza fusao');
+    // so referencia cruzada, nunca absorcao
+    expect(prompt).toContain('So e permitida REFERENCIA CRUZADA');
+    // contagem escopada aos selecionados: correlatos/apoio nao viram bloco
+    expect(prompt).toContain('deve COINCIDIR com esse total de selecionados');
+    expect(prompt).toContain('estar no contexto nunca obriga a incluir');
+  });
+
+  test('separa contexto em dispositivos centrais e material de apoio pelo role da proveniencia', () => {
+    const docs = [
+      new Document({ pageContent: 'central 9', metadata: { title: 'IN05', n1_header: 'ANEXO VIII-B', n2_header: '9.', role: 'PRINCIPAL' } }),
+      new Document({ pageContent: 'apoio 10.4', metadata: { title: 'IN05', n1_header: 'ANEXO VIII-B', n2_header: '10.4.', role: 'COMPLEMENTAR' } }),
+    ];
+    const p = buildRagPrompt(docs, 'Quais as rotinas mensais?');
+
+    // o cabecalho de contexto "=== MATERIAL DE APOIO" so aparece quando ha apoio
+    expect(p).toContain('=== MATERIAL DE APOIO');
+    expect(p).toContain('NAO gere bloco proprio para estes');
+    // no bloco de contexto: central antes do cabecalho de apoio, apoio depois
+    const apoioHeader = p.indexOf('=== MATERIAL DE APOIO');
+    expect(p.indexOf('central 9')).toBeLessThan(apoioHeader);
+    expect(apoioHeader).toBeLessThan(p.indexOf('apoio 10.4'));
+  });
+
+  test('sem material de apoio, nao insere o cabecalho de contexto de apoio', () => {
+    const docs = [
+      new Document({ pageContent: 'central A', metadata: { title: 'IN05', n1_header: 'ANEXO I', n2_header: '1.', role: 'PRINCIPAL' } }),
+    ];
+    // a mencao nas REGRAS pode existir; o cabecalho "===" do contexto, nao
+    expect(buildRagPrompt(docs, 'x')).not.toContain('=== MATERIAL DE APOIO');
   });
 
   test('instrui a sinalizar subitem referido cujo texto nao consta dos trechos', () => {

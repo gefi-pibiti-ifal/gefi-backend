@@ -5,6 +5,8 @@ import {
   applyHierarchicalBoost,
   expandWithNeighbors,
   flattenClusters,
+  pruneForeignAnexoContamination,
+  rankByProvenance,
   deriveSiblingPrefix,
   sortParentsByStructuralOrder,
   compareParentsByStructuralOrder,
@@ -12,6 +14,7 @@ import {
   MAX_EXPANDED_CHARS,
   MAX_NEIGHBOR_DISTANCE,
   ParentChunkRow,
+  Provenance,
 } from './hierarchical-context';
 import { buildRagPrompt } from './rag.service';
 
@@ -186,5 +189,138 @@ describe('hierarchical-context', () => {
   test('MAX_NEIGHBOR_DISTANCE e um numero positivo e usado para ordenar proximidade', () => {
     expect(typeof MAX_NEIGHBOR_DISTANCE).toBe('number');
     expect(MAX_NEIGHBOR_DISTANCE).toBeGreaterThan(0);
+  });
+});
+
+describe('pruneForeignAnexoContamination', () => {
+  const anexoRow = (id: string, documentId: string, n1: string) =>
+    makeRow({ id, document_id: documentId, section_header: n1, content: 'x'.repeat(120), metadata: { n1_header: n1 } });
+
+  test('remove anexo estranho do mesmo documento com apoio fraco (1 hit) quando ha dominante', () => {
+    const parents = [
+      anexoRow('p1', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p2', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p3', 'in05', 'ANEXO V-B'), // fiscal tecnico — boilerplate paralelo
+    ];
+    const hits = new Map<string, number>([
+      ['in05|||ANEXO VIII-B', 2],
+      ['in05|||ANEXO V-B', 1],
+    ]);
+
+    const pruned = pruneForeignAnexoContamination(parents, hits);
+
+    expect(pruned.map((r) => r.id)).toEqual(['p1', 'p2']);
+  });
+
+  test('preserva anexo estrangeiro corroborado (>= 2 hits)', () => {
+    const parents = [
+      anexoRow('p1', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p2', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p3', 'in05', 'ANEXO V-B'),
+      anexoRow('p4', 'in05', 'ANEXO V-B'),
+    ];
+    const hits = new Map<string, number>([
+      ['in05|||ANEXO VIII-B', 2],
+      ['in05|||ANEXO V-B', 2],
+    ]);
+
+    const pruned = pruneForeignAnexoContamination(parents, hits);
+
+    expect(pruned).toHaveLength(4);
+  });
+
+  test('preserva conteudo de OUTRO documento com 1 hit (resposta multi-norma)', () => {
+    const parents = [
+      anexoRow('p1', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p2', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p3', 'lei-8666', 'CAPITULO III'), // outro documento
+    ];
+    const hits = new Map<string, number>([
+      ['in05|||ANEXO VIII-B', 2],
+      ['lei-8666|||CAPITULO III', 1],
+    ]);
+
+    const pruned = pruneForeignAnexoContamination(parents, hits);
+
+    expect(pruned.map((r) => r.id)).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  test('nao poda quando nao ha escopo dominante claro (todos com 1 hit)', () => {
+    const parents = [
+      anexoRow('p1', 'in05', 'ANEXO VIII-B'),
+      anexoRow('p2', 'in05', 'ANEXO V-B'),
+    ];
+    const hits = new Map<string, number>([
+      ['in05|||ANEXO VIII-B', 1],
+      ['in05|||ANEXO V-B', 1],
+    ]);
+
+    const pruned = pruneForeignAnexoContamination(parents, hits);
+
+    expect(pruned).toHaveLength(2);
+  });
+
+  test('escopo unico passa inalterado', () => {
+    const parents = [anexoRow('p1', 'in05', 'ANEXO VIII-B'), anexoRow('p2', 'in05', 'ANEXO VIII-B')];
+    const hits = new Map<string, number>([['in05|||ANEXO VIII-B', 2]]);
+
+    expect(pruneForeignAnexoContamination(parents, hits)).toHaveLength(2);
+  });
+});
+
+describe('rankByProvenance', () => {
+  const row = (id: string) =>
+    makeRow({ id, document_id: 'in05', section_header: id, content: 'x'.repeat(120) });
+
+  const provOf = (...pairs: Array<[string, Provenance[]]>) =>
+    new Map(pairs.map(([id, ps]) => [id, new Set<Provenance>(ps)]));
+
+  test('hit direto e descendente sao PRINCIPAL; irmao-so e COMPLEMENTAR', () => {
+    // 9 (hit), 10.2 (hit), 10.2.1 (descendente de 10.2), 10.4/10.5 (irmaos de 10.2)
+    const parents = [row('9'), row('10.2'), row('10.2.1'), row('10.4'), row('10.5')];
+    const prov = provOf(
+      ['9', ['HIT']],
+      ['10.2', ['HIT']],
+      ['10.2.1', ['DESCENDANT']],
+      ['10.4', ['SIBLING']],
+      ['10.5', ['SIBLING']],
+    );
+
+    const ranked = rankByProvenance(parents, prov);
+    const roleById = new Map(ranked.map((r) => [r.row.id, r.role]));
+
+    expect(roleById.get('9')).toBe('PRINCIPAL');
+    expect(roleById.get('10.2')).toBe('PRINCIPAL');
+    expect(roleById.get('10.2.1')).toBe('PRINCIPAL');
+    expect(roleById.get('10.4')).toBe('COMPLEMENTAR');
+    expect(roleById.get('10.5')).toBe('COMPLEMENTAR');
+  });
+
+  test('centrais vem antes dos complementares, preservando a ordem interna', () => {
+    const parents = [row('10.4'), row('9'), row('10.5'), row('10.2')]; // apoio intercalado
+    const prov = provOf(
+      ['9', ['HIT']],
+      ['10.2', ['HIT']],
+      ['10.4', ['SIBLING']],
+      ['10.5', ['SIBLING']],
+    );
+
+    const ranked = rankByProvenance(parents, prov);
+
+    // ordem estavel: centrais (9, 10.2 na ordem de entrada) e depois apoio (10.4, 10.5)
+    expect(ranked.map((r) => r.row.id)).toEqual(['9', '10.2', '10.4', '10.5']);
+  });
+
+  test('multipla proveniencia (hit + irmao) prevalece como PRINCIPAL', () => {
+    const parents = [row('7')];
+    const prov = provOf(['7', ['SIBLING', 'HIT']]);
+    expect(rankByProvenance(parents, prov)[0].role).toBe('PRINCIPAL');
+  });
+
+  test('proveniencia desconhecida nao rebaixa (conservador, preserva recall)', () => {
+    const parents = [row('desconhecido')];
+    const ranked = rankByProvenance(parents, new Map());
+    expect(ranked[0].role).toBe('PRINCIPAL');
+    expect(ranked[0].provenance).toEqual([]);
   });
 });
