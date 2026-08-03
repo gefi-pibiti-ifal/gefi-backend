@@ -7,19 +7,19 @@ export declare class ChatController {
     createConversation(body: {
         title: string;
     }, req: any): Promise<{
-        title: string;
         id: string;
         created_at: Date;
         updated_at: Date;
-        deleted_at: Date | null;
+        title: string;
         is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     getConversations(req: any, page?: string, limit?: string): Promise<{
         data: {
-            title: string;
             id: string;
             created_at: Date;
+            title: string;
             is_pinned: boolean;
         }[];
         meta: {
@@ -39,12 +39,12 @@ export declare class ChatController {
             conversation_id: string;
         }[];
     } & {
-        title: string;
         id: string;
         created_at: Date;
         updated_at: Date;
-        deleted_at: Date | null;
+        title: string;
         is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }) | null>;
     ask(body: {
@@ -82,32 +82,32 @@ export declare class ChatController {
     renameConversation(id: string, body: {
         title: string;
     }, req: any): Promise<{
-        title: string;
         id: string;
         created_at: Date;
         updated_at: Date;
-        deleted_at: Date | null;
+        title: string;
         is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     togglePin(id: string, body: {
         is_pinned: boolean;
     }, req: any): Promise<{
-        title: string;
         id: string;
         created_at: Date;
         updated_at: Date;
-        deleted_at: Date | null;
+        title: string;
         is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
     softDelete(id: string, req: any): Promise<{
-        title: string;
         id: string;
         created_at: Date;
         updated_at: Date;
-        deleted_at: Date | null;
+        title: string;
         is_pinned: boolean;
+        deleted_at: Date | null;
         user_id: string;
     }>;
 }
