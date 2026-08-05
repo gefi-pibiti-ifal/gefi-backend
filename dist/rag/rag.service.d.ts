@@ -7,6 +7,8 @@ export declare function snapWindowStart(content: string, start: number): number;
 export declare function snapWindowEnd(content: string, end: number): number;
 export declare function stripInvisibleArtifacts(text: string): string;
 export declare function dehyphenateAttested(text: string): string;
+export declare const SECTION_HEADER_FALLBACK = "Secao";
+export declare function normalizeDocumentTitle(title: string): string;
 export declare function buildSourceLabel(doc: Document, index: number): string;
 export declare function buildChunkEmbedText(rawChild: string, ctx: {
     title?: string;

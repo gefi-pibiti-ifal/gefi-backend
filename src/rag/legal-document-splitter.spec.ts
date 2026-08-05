@@ -1,7 +1,6 @@
 import {
   parseItemNumber,
   isValidTitleSuffix,
-  looksLikeHeading,
   isSequentialItem,
   isStructuralItem,
   extractItemHeader,
@@ -95,45 +94,76 @@ describe('isValidTitleSuffix', () => {
 });
 
 // ---------------------------------------------------------------------------
-// looksLikeHeading
+// Aberturas de clausula que a antiga camada looksLikeHeading rejeitava.
+//
+// Regressao do caso real: no contrato indexado, "3.1. O prazo de vigencia...
+// ate o limite de 60 (sessenta) meses" nunca virava ParentChunk proprio
+// porque o sufixo "O prazo" (maiuscula isolada + espaco) nao casava com a
+// allowlist de formas de titulo — a clausula de vigencia era absorvida pelo
+// chunk da tabela de precos e nao aparecia no Top-K da busca vetorial.
 // ---------------------------------------------------------------------------
-describe('looksLikeHeading', () => {
-  describe('deve retornar TRUE', () => {
-    const cases: [string, string][] = [
-      [' Fiscalização mensal',    'título comum'],
-      [' Avaliação',              'título comum'],
-      [' CAPÍTULO II',            'CAPÍTULO'],
-      [' SEÇÃO I',                'SEÇÃO'],
-      [' SUBSEÇÃO III',           'SUBSEÇÃO'],
-      [' ANEXO VIII-B',           'ANEXO'],
-      [' Parágrafo único',        'Parágrafo único'],
-      [' parágrafo único',        'parágrafo único minúsculo'],
-      [' §',                      'símbolo §'],
-      [' I',                      'numeral romano I'],
-      [' II',                     'numeral romano II'],
-      [' III',                    'numeral romano III'],
-      [' IV',                     'numeral romano IV'],
-      [' V',                      'numeral romano V'],
-      [' Inciso',                 'Inciso'],
-      [' Alínea',                 'Alínea'],
-      [' Das penalidades',        'preposição + substantivo'],
-      [' Do pagamento',           'preposição + substantivo'],
-      [' No caso de empresas',    'preposição + substantivo'],
+describe('isStructuralItem — aberturas de clausula de contrato (regressao)', () => {
+  describe('deve aceitar clausulas iniciadas por artigo/conjuncao de uma letra', () => {
+    const cases: [string, string, string][] = [
+      ['3.1. O prazo de vigência deste Termo de Contrato é de 24 (vinte e quatro) meses', '3.', 'clausula iniciada por "O"'],
+      ['2.1. A presente contratação fundamenta-se no art. 2º', '1.3', 'clausula iniciada por "A"'],
+      ['4.2. E ainda deverá ser comprovada a regularidade fiscal', '4.1.', 'clausula iniciada por "E"'],
+      ['9. É permitida a licitação:', '8.', 'item iniciado por "É" acentuado'],
     ];
-    test.each(cases)('"%s" (%s)', (suffix) => {
-      expect(looksLikeHeading(suffix)).toBe(true);
+    test.each(cases)('%s (current="%s") — %s', (line, current) => {
+      expect(isStructuralItem(line, current)).toBe(true);
     });
   });
 
-  describe('deve retornar FALSE', () => {
-    const cases: [string, string][] = [
-      ['',           'vazio'],
-      [', de 1993',  'vírgula'],
-      ['/2021',      'barra'],
-      [' 8.666',     'número'],
+  describe('deve aceitar titulos totalmente em caixa alta', () => {
+    const cases: [string, string, string][] = [
+      ['3.         CLÁUSULA TERCEIRA – VIGÊNCIA', '2.1.', 'titulo de clausula em caixa alta'],
+      ['11. CLÁUSULA DÉCIMA PRIMEIRA – SANÇÕES ADMINISTRATIVAS', '8.1.', 'titulo caixa alta apos salto'],
+      ['12. CLÁUSULA DÉCIMA SEGUNDA – RESCISÃO CONTRATUAL', '11.1.', 'titulo caixa alta sequencial'],
     ];
-    test.each(cases)('"%s" (%s)', (suffix) => {
-      expect(looksLikeHeading(suffix)).toBe(false);
+    test.each(cases)('%s (current="%s") — %s', (line, current) => {
+      expect(isStructuralItem(line, current)).toBe(true);
+    });
+  });
+
+  describe('prefixo com espaco de artefato de PDF ("N .")', () => {
+    test('"2 .  CLÁUSULA SEGUNDA – FUNDAMENTO LEGAL" e item estrutural', () => {
+      expect(isStructuralItem('2 .  CLÁUSULA SEGUNDA – FUNDAMENTO LEGAL', '1.3')).toBe(true);
+    });
+
+    test('extractItemHeader normaliza "2 ." para a forma canonica "2."', () => {
+      expect(extractItemHeader('2 .  CLÁUSULA SEGUNDA – FUNDAMENTO LEGAL')).toBe('2.');
+    });
+  });
+
+  describe('numeros de lei continuam rejeitados mesmo sem estado corrente', () => {
+    const cases: [string, string][] = [
+      ['8.666Fiscalização', 'numero de lei colado a texto'],
+      ['14.133 Serviços de contratação', 'numero de lei + texto'],
+      ['10.520 Pagamento', 'numero de lei + texto'],
+    ];
+    test.each(cases)('"%s" (%s) → false', (line) => {
+      expect(isStructuralItem(line)).toBe(false);
+    });
+  });
+
+  describe('enumeracao decimal dentro de ARTIGO nao abre grupo (caso IN SEGES 147)', () => {
+    test('continuacao de frase em minuscula apos artigo permanece conteudo', () => {
+      expect(isStructuralItem('1. do limite de idade da criança para a concessão do benefício; e', 'Art. 4')).toBe(false);
+      expect(isStructuralItem('2. da obrigatoriedade ou dispensa de comprovação de despesas pelo beneficiário; ou', 'Art. 4')).toBe(false);
+    });
+
+    test('titulo capitalizado apos artigo continua abrindo grupo', () => {
+      expect(isStructuralItem('1. Introdução', 'Art. 4')).toBe(true);
+      expect(isStructuralItem('1. Do objeto', 'Art. 4')).toBe(true);
+    });
+
+    test('item multi-nivel apos artigo nao e afetado pelo guard', () => {
+      expect(isStructuralItem('10.1. das obrigações previstas na norma', 'Art. 5')).toBe(true);
+    });
+
+    test('fora do estado de artigo, minuscula apos numero segue aceita', () => {
+      expect(isStructuralItem('2. das penalidades aplicáveis ao caso', '1.')).toBe(true);
     });
   });
 });
@@ -168,6 +198,16 @@ describe('isSequentialItem', () => {
       ['10.5.3.', '11.',     'multi-nível profundo → nível único'],
       ['2.3.4.',  '3.',      'multi-nível → nível único menor avanço'],
       ['8.1.',    '9.',      'dois níveis → nível único'],
+      // Profundidade >= 3 — regressao: a regra antiga so tratava nivel 2 e
+      // rejeitava TODA transicao de irmaos em nivel 3+, fundindo os subitens
+      // de uma clausula ("3.2.1." absorvia 3.2.2 a 3.2.11 no contrato real).
+      ['3.1.1.',  '3.1.2.',  'irmão em profundidade 3'],
+      ['3.2.1.',  '3.2.2.',  'irmão em profundidade 3'],
+      ['3.2.10.', '3.2.11.', 'irmão de dois dígitos em profundidade 3'],
+      ['12.7.1.', '12.7.2.', 'irmão em profundidade 3 (seção alta)'],
+      ['3.1.6.',  '3.2.1.',  'novo bloco em profundidade 3'],
+      ['3.2.11.', '3.3.',    'subida de nível após subitens'],
+      ['17.2.3.', '17.3.',   'subida de nível em seção alta'],
     ];
     test.each(cases)('current="%s" candidate="%s" (%s)', (curr, cand) => {
       expect(isSequentialItem(curr, cand)).toBe(true);
@@ -186,6 +226,13 @@ describe('isSequentialItem', () => {
       // C1: multi-nível → nível único com retrocesso
       ['10.2.1.', '9.',      'multi-nível → nível único com retrocesso'],
       ['10.2.1.', '8.',      'multi-nível → nível único com retrocesso maior'],
+      // Profundidade >= 3 — retrocessos e formas implausíveis
+      ['3.1.2.',  '3.1.1.',  'retrocesso de irmão em profundidade 3'],
+      ['3.2.5.',  '3.1.9.',  'retrocesso de bloco em profundidade 3'],
+      ['10.2.',   '10.2.1.1.', 'descida de dois níveis de uma vez'],
+      ['17.',     '2024.',   'salto absurdo de nível único (ano em prosa)'],
+      ['3.',      '3.',      'mesmo número não é transição'],
+      ['10.2.',   '10.2.',   'mesmo número multi-nível não é transição'],
     ];
     test.each(cases)('current="%s" candidate="%s" (%s)', (curr, cand) => {
       expect(isSequentialItem(curr, cand)).toBe(false);
@@ -449,6 +496,129 @@ describe('splitLegalDocument — preservação de conteúdo', () => {
     const chunk103 = chunks.find(c => c.metadata.n2_header === '10.3.');
     expect(chunk103).toBeDefined();
     expect(chunk103!.content).toContain('Fiscalização diária');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// splitLegalDocument — termo de contrato administrativo (regressao integral)
+//
+// Reproduz em miniatura a estrutura do CONTRATO_N_06_2024-REITORIA que expos
+// os tres defeitos do splitter:
+//   1. clausulas iniciadas por "O"/"A" e titulos em caixa alta nao viravam
+//      fronteira (looksLikeHeading) — a clausula de vigencia era absorvida
+//      pelo chunk da tabela de precos;
+//   2. "anexo do Edital." em prosa disparava RE_ANEXO/i e rotulava todo o
+//      resto do documento com o anexo fantasma "ANEXO DO";
+//   3. subitens de profundidade 3 (3.1.1, 3.1.2) nao geravam grupos proprios.
+// ---------------------------------------------------------------------------
+describe('splitLegalDocument — termo de contrato administrativo', () => {
+  const contrato = [
+    'INSTITUTO FEDERAL DE EXEMPLO',
+    'TERMO DE CONTRATO DE PRESTAÇÃO DE SERVIÇOS QUE FAZEM ENTRE SI A UNIÃO E A EMPRESA EXEMPLO LTDA.',
+    '1 .  CLÁUSULA PRIMEIRA – OBJETO',
+    '1.1 .O  objeto  do  presente  instrumento  é  a  contratação  de  serviços  continuados de limpeza.',
+    '2 .  CLÁUSULA SEGUNDA – FUNDAMENTO LEGAL',
+    '2.1. A presente contratação fundamenta-se no art. 2º, da Lei nº 8.666/93 e demais normas aplicáveis.',
+    '3.         CLÁUSULA TERCEIRA – VIGÊNCIA',
+    '3.1. O prazo de vigência deste Termo de Contrato é de 24 (vinte e quatro) meses, podendo ser prorrogado até o limite de 60 (sessenta) meses.',
+    '3.1.1. formalmente demonstrado que a forma de prestação dos serviços tem natureza continuada;',
+    '3.1.2. Seja juntado relatório que discorra sobre a execução do contrato durante toda a vigência.',
+    '8.1. Será exigida a prestação de garantia na presente contratação, conforme regras do Termo de Referência,',
+    'anexo do Edital.',
+    '11. CLÁUSULA DÉCIMA PRIMEIRA – SANÇÕES ADMINISTRATIVAS',
+    '11.1. As sanções relacionadas à execução do contrato são aquelas previstas no Termo de Referência.',
+  ].join('\n');
+
+  const chunks = splitLegalDocument(contrato);
+  const byN2 = (n2: string) => chunks.find(c => c.metadata.n2_header === n2);
+
+  test('a clausula de vigencia (3.1) vira grupo proprio com o prazo de prorrogacao', () => {
+    const chunk31 = byN2('3.1.');
+    expect(chunk31).toBeDefined();
+    expect(chunk31!.content).toContain('60 (sessenta) meses');
+    // e NAO carrega conteudo de outras clausulas
+    expect(chunk31!.content).not.toContain('CLÁUSULA SEGUNDA');
+    expect(chunk31!.content).not.toContain('objeto');
+  });
+
+  test('titulos de clausula em caixa alta viram grupos proprios', () => {
+    expect(byN2('3.')).toBeDefined();
+    expect(byN2('3.')!.content).toContain('CLÁUSULA TERCEIRA');
+    expect(byN2('11.')).toBeDefined();
+    expect(byN2('11.')!.content).toContain('SANÇÕES ADMINISTRATIVAS');
+  });
+
+  test('prefixo "N ." com espaco de PDF vira grupo com header canonico', () => {
+    expect(byN2('2.')).toBeDefined();
+    expect(byN2('2.')!.content).toContain('FUNDAMENTO LEGAL');
+  });
+
+  test('subitens de profundidade 3 viram grupos separados', () => {
+    expect(byN2('3.1.1.')).toBeDefined();
+    expect(byN2('3.1.2.')).toBeDefined();
+    expect(byN2('3.1.1.')!.content).toContain('natureza continuada');
+    expect(byN2('3.1.2.')!.content).toContain('relatório');
+  });
+
+  test('"anexo do Edital." em prosa NAO vira transicao de anexo', () => {
+    // nenhum grupo rotulado com anexo fantasma
+    for (const chunk of chunks) {
+      expect(chunk.metadata.n1_header).toBe('');
+    }
+    // a frase permanece como conteudo do grupo em que ocorre (8.1)
+    const chunk81 = byN2('8.1.');
+    expect(chunk81).toBeDefined();
+    expect(chunk81!.content).toContain('anexo do Edital.');
+  });
+
+  test('clausulas iniciadas por "O"/"A" viram grupos proprios', () => {
+    expect(byN2('1.1')).toBeDefined();
+    expect(byN2('1.1')!.content).toContain('objeto');
+    expect(byN2('2.1.')).toBeDefined();
+    expect(byN2('2.1.')!.content).toContain('fundamenta-se');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// splitLegalDocument — referencia a anexo em prosa dentro de norma
+//
+// Na IN 05 real, linhas como "Anexo V-B, ou outro instrumento substituto..."
+// (referencia em caixa mista no inicio de linha, artefato de quebra do PDF)
+// disparavam RE_ANEXO/i e mudavam o estado para um anexo errado, rotulando os
+// itens seguintes com n1_header incorreto.
+// ---------------------------------------------------------------------------
+describe('splitLegalDocument — referencia a anexo em prosa nao muda o estado', () => {
+  test('referencia em caixa mista permanece no anexo corrente', () => {
+    const texto = [
+      'ANEXO V-A',
+      '1. Conteúdo do primeiro item do anexo V-A com texto suficiente para o grupo existir.',
+      'Anexo V-B, ou outro instrumento substituto para aferição da qualidade.',
+      '2. Segundo item ainda dentro do anexo V-A, com texto suficiente para o grupo existir.',
+    ].join('\n');
+
+    const chunks = splitLegalDocument(texto);
+
+    // nenhum grupo rotulado com o anexo referido em prosa
+    expect(chunks.some(c => c.metadata.n1_header === 'ANEXO V-B')).toBe(false);
+    // os dois itens pertencem ao ANEXO V-A e a referencia vira conteudo do item 1
+    const chunk1 = chunks.find(c => c.metadata.n2_header === '1.');
+    const chunk2 = chunks.find(c => c.metadata.n2_header === '2.');
+    expect(chunk1?.metadata.n1_header).toBe('ANEXO V-A');
+    expect(chunk1?.content).toContain('Anexo V-B, ou outro instrumento');
+    expect(chunk2?.metadata.n1_header).toBe('ANEXO V-A');
+  });
+
+  test('cabecalho genuino em caixa alta continua transicionando', () => {
+    const texto = [
+      'ANEXO VIII-B',
+      '1. Item do anexo VIII-B com texto suficiente para o grupo nao ser descartado.',
+      'ANEXO IX',
+      '1. Item do anexo IX com texto suficiente para o grupo nao ser descartado.',
+    ].join('\n');
+
+    const chunks = splitLegalDocument(texto);
+    expect(chunks.some(c => c.metadata.n1_header === 'ANEXO VIII-B')).toBe(true);
+    expect(chunks.some(c => c.metadata.n1_header === 'ANEXO IX')).toBe(true);
   });
 });
 

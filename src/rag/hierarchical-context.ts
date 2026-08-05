@@ -29,12 +29,15 @@ import type { Prisma } from '@prisma/client';
 
 /**
  * Número máximo de ParentChunks enviados ao LLM após expansão.
- * Elevado de 8 para 14 com a expansão descendente: um dispositivo enumerado
- * (caput + subitens 10.2.1..N) somado ao Item 9 e a poucos irmãos já passava
- * de 8, e o flatten cortava justamente a cauda dos subitens — reintroduzindo
- * a resposta incompleta que a expansão busca resolver.
+ * Elevado de 8 para 14 com a expansão descendente (caput + subitens de um
+ * dispositivo enumerado ja passava de 8) e de 14 para 20 com as perguntas
+ * transversais: uma consulta que atravessa corpo da norma + varios anexos +
+ * contrato produz 5-7 clusters legitimos, e com 14 o flatten cortava os
+ * clusters da cauda inteiros. A selecao round-robin do flatten garante um
+ * representante por cluster antes de aprofundar; o teto de chars segue sendo
+ * o freio real de orcamento.
  */
-export const MAX_EXPANDED_PARENTS = 14;
+export const MAX_EXPANDED_PARENTS = 20;
 
 /**
  * Limite total de caracteres do contexto enviado ao LLM.
@@ -76,6 +79,31 @@ export const EXPAND_ONLY_SAME_DOCUMENT = true;
  */
 export const MIN_DOMINANT_SCOPE_HITS = 2;
 export const MIN_FOREIGN_ANEXO_HITS  = 2;
+
+/**
+ * Dominancia entre HITs irmaos — precisao DENTRO de uma mesma familia
+ * estrutural (mesmo item pai + mesmo nivel; ex.: 10.1/10.2/10.4/10.5 sob "10.").
+ *
+ * A busca vetorial pode devolver, dentro do MESMO grupo de irmaos, mais de um
+ * HIT direto: nao so o dispositivo realmente pedido, mas tambem "modalidades"
+ * vizinhas que compartilham vocabulario com a pergunta (mesmo titulo
+ * generico da secao, mesmo preambulo injetado no contextual embedding, termos
+ * incidentais em comum — ex.: um item sobre fiscalizacao por amostragem cujo
+ * texto cita "qualquer mes" tambem ressoa com uma pergunta sobre rotina
+ * MENSAL). Sem este ajuste, todo HIT vira PRINCIPAL com o mesmo peso do hit
+ * mais forte, mesmo quando o proprio score do retriever ja indica que ele e
+ * um "carona" fraco dentro da familia.
+ *
+ * O limiar e RELATIVO ao espalhamento (spread) de scores observado ENTRE OS
+ * HITS desta recuperacao especifica — nunca um valor absoluto fixo. Se a
+ * pergunta legitimamente abrange varias modalidades (todas com score
+ * parecido), nenhuma e rebaixada: o mecanismo so age quando ha uma folga
+ * clara entre o hit-ancora da familia e os demais. Deterministico, auditavel
+ * e geral — usa apenas a arvore do documento (deriveSiblingPrefix, generico
+ * para qualquer norma numerada) e o score vetorial ja calculado; nenhuma
+ * regra por norma ou por dispositivo especifico.
+ */
+export const SIBLING_HIT_DOMINANCE_FRACTION = 0.3;
 
 // ---------------------------------------------------------------------------
 // Tipos
@@ -254,12 +282,75 @@ export function applyHierarchicalBoost(clusters: RetrievalCluster[]): RetrievalC
 //   - preserva anexos estrangeiros corroborados (>= MIN_FOREIGN_ANEXO_HITS) e
 //     qualquer conteudo de OUTROS documentos (respostas multi-norma legitimas).
 //
-// `retrievedScopeHits`: mapa `${document_id}|||${n1_header}` -> nº de parents
-//   efetivamente recuperados pelo vetor naquele escopo (nao expandidos).
+// `retrievedScopeHits`: mapa `${document_id}|||${n1_header}` -> nº de CHILD HITS
+//   do retriever naquele escopo (nao expandidos). Contar CHILDS, e nao parents,
+//   e essencial: um dispositivo longo (ex.: um artigo de lei com dezenas de
+//   incisos) monopoliza o Top-K com varios childs que colapsam num unico
+//   parent. Contando parents ele valeria "1" e perderia a dominancia para dois
+//   artigos curtos e irrelevantes — foi exatamente assim que o Art. 75 da Lei
+//   14.133, primeiro colocado do ranking com 6 dos 12 childs, foi podado de uma
+//   consulta sobre os limites de dispensa que ele mesmo responde.
+//
+// `topScope`: escopo do hit de MELHOR score. Nunca e podado, aconteca o que
+//   acontecer na contagem — o primeiro colocado da busca vetorial e a evidencia
+//   mais forte que o sistema tem, e nenhuma heuristica de corroboracao pode
+//   descarta-lo. Guarda de seguranca independente da contagem.
+//
+// Criterio de REMOCAO (assinatura real da contaminacao): um escopo estrangeiro
+// fraco so e removido se o seu conteudo for QUASE-DUPLICATA de algum parent do
+// escopo dominante presente no conjunto candidato. E essa a assinatura do
+// boilerplate paralelo (a rotina do fiscal tecnico espelhando a do fiscal
+// administrativo): texto redundante que nada acrescenta. Conteudo DIFERENTE
+// vindo de outro anexo/secao e, em geral, complementar — perguntas transversais
+// legitimamente atravessam corpo da norma + varios anexos + contrato. Medido no
+// corpus real: conteudo transversal legitimo fica com containment 0.07–0.13
+// contra o dominante; espelhos ficam acima de NEAR_DUPLICATE_CONTAINMENT.
+// (Antes, a corroboracao por contagem sozinha removia dispositivos centrais:
+// numa pergunta sobre pagamento direto de salarios, o Art. 65 da IN — fonte dos
+// recursos e prazo de 15 dias — era podado por ter 1 hit contra 4 do anexo
+// dominante, apesar de nao ter NADA redundante com ele.)
 // ---------------------------------------------------------------------------
+
+/**
+ * Limiar de containment de tokens (fracao dos tokens do candidato presentes no
+ * parent dominante) acima do qual o conteudo e tratado como duplicata
+ * paralela. Calibrado no corpus: transversal legitimo <= ~0.13; espelho >= ~0.5.
+ */
+export const NEAR_DUPLICATE_CONTAINMENT = 0.6;
+
+// Minimo de tokens para o containment ser estatisticamente significativo;
+// abaixo disso, so a igualdade exata do texto normalizado conta como duplicata.
+const NEAR_DUPLICATE_MIN_TOKENS = 8;
+
+function contentTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .normalize('NFD')
+      .replace(/[̀-ͯ]/g, '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 4),
+  );
+}
+
+export function isNearDuplicateContent(candidate: string, reference: string): boolean {
+  const normA = normalizeWhitespace(candidate);
+  const normB = normalizeWhitespace(reference);
+  if (normA === normB) return true;
+
+  const ta = contentTokens(candidate);
+  const tb = contentTokens(reference);
+  if (ta.size < NEAR_DUPLICATE_MIN_TOKENS || tb.size < NEAR_DUPLICATE_MIN_TOKENS) return false;
+
+  let shared = 0;
+  for (const t of ta) if (tb.has(t)) shared++;
+  return shared / ta.size >= NEAR_DUPLICATE_CONTAINMENT;
+}
+
 export function pruneForeignAnexoContamination(
   parents:            ParentChunkRow[],
   retrievedScopeHits: Map<string, number>,
+  topScope?:          string,
 ): ParentChunkRow[] {
   if (retrievedScopeHits.size <= 1) return parents;
 
@@ -274,12 +365,20 @@ export function pruneForeignAnexoContamination(
   const dominantDoc  = dominantScope.slice(0, sep);
   const dominantN1   = dominantScope.slice(sep + 3);
 
+  const dominantRows = parents.filter(
+    (row) => row.document_id === dominantDoc && getN1Header(row) === dominantN1,
+  );
+
   return parents.filter((row) => {
-    const n1 = getN1Header(row);
+    const n1    = getN1Header(row);
+    const scope = `${row.document_id}|||${n1}`;
+    if (scope === topScope) return true; // melhor hit da busca: imune
     const sameDocForeignAnexo = row.document_id === dominantDoc && n1 !== dominantN1;
     if (!sameDocForeignAnexo) return true; // dominante e outros documentos permanecem
-    const hits = retrievedScopeHits.get(`${row.document_id}|||${n1}`) ?? 0;
-    return hits >= MIN_FOREIGN_ANEXO_HITS;
+    if ((retrievedScopeHits.get(scope) ?? 0) >= MIN_FOREIGN_ANEXO_HITS) return true;
+    // Escopo fraco: remove apenas se REDUNDANTE com o dominante — conteudo
+    // distinto e complementar e permanece (perguntas transversais).
+    return !dominantRows.some((dom) => isNearDuplicateContent(row.content, dom.content));
   });
 }
 
@@ -298,10 +397,19 @@ export function pruneForeignAnexoContamination(
 // quem entrou APENAS por SIBLING. Nada e removido — so a prioridade muda, com os
 // centrais a frente (ordem estavel). Substitui o antigo criterio por score.
 //
-// Limite conhecido: nao distingue papeis ORTOGONAIS a estrutura — um hit direto
-// que e excecao/variante (ex.: "comunicar em caso de irregularidade") e
-// estruturalmente identico a um hit central e permanece PRINCIPAL. Esse residuo
-// semantico so uma camada de intencao (LLM/classificador) resolve.
+// Excecao (dominancia entre HITs irmaos): quando o CONJUNTO CANDIDATO contem
+// mais de um HIT direto dentro da MESMA familia estrutural (mesmo item pai +
+// mesmo nivel — ver deriveSiblingPrefix) e um deles tem score muito mais fraco
+// que o ancora da familia (ver SIBLING_HIT_DOMINANCE_FRACTION), esse HIT fraco
+// e tratado como se fosse SIBLING — o proprio retriever ja sinalizou, pelo
+// score, que ele e um "carona" e nao o dispositivo pedido. Continua central
+// quem tem DESCENDANT (completa o MESMO dispositivo, nunca compete com irmaos).
+//
+// Limite conhecido: nao distingue papeis ORTOGONAIS a estrutura quando os
+// scores dos HITs irmaos ficam proximos (dentro do limiar) — ex.: um hit direto
+// que e excecao/variante mas com score parecido ao do hit central permanece
+// PRINCIPAL. Esse residuo semantico, quando nao ha folga de score que o
+// evidencie, so uma camada de intencao (LLM/classificador) resolveria.
 // ---------------------------------------------------------------------------
 export type Provenance = 'HIT' | 'DESCENDANT' | 'SIBLING';
 
@@ -311,15 +419,82 @@ export interface RankedParent {
   provenance: Provenance[];
 }
 
+function siblingFamilyKey(row: ParentChunkRow, parentPrefix: string, level: number): string {
+  return `${row.document_id}|||${getN1Header(row)}|||${parentPrefix}|||${level}`;
+}
+
+/**
+ * Identifica HITs "dominados": irmaos estruturais de um HIT muito mais forte
+ * dentro do MESMO grupo (mesmo item pai + mesmo nivel), cuja folga de score em
+ * relacao ao ancora da familia excede SIBLING_HIT_DOMINANCE_FRACTION do
+ * espalhamento observado entre os HITs desta recuperacao. Ver o comentario da
+ * constante para o raciocinio completo.
+ *
+ * So considera rows com proveniencia HIT "pura" (sem DESCENDANT): um
+ * descendente completa o MESMO dispositivo do seu hit-pai e nunca deve ser
+ * rebaixado por este mecanismo, que trata apenas de competicao ENTRE
+ * dispositivos irmaos — nunca entre um dispositivo e suas proprias partes.
+ */
+function findDominatedSiblingHits(
+  parents:         ParentChunkRow[],
+  provenanceById:  Map<string, Set<Provenance>>,
+  scoreByParentId: Map<string, number>,
+): Set<string> {
+  const dominated = new Set<string>();
+  if (scoreByParentId.size === 0) return dominated;
+
+  const hitRows = parents.filter((row) => {
+    const prov = provenanceById.get(row.id);
+    return !!prov?.has('HIT') && !prov.has('DESCENDANT');
+  });
+
+  const hitScores = hitRows
+    .map((row) => scoreByParentId.get(row.id))
+    .filter((s): s is number => s !== undefined && Number.isFinite(s));
+  if (hitScores.length < 2) return dominated; // sem 2+ scores nao ha spread para calibrar
+
+  const spread = Math.max(...hitScores) - Math.min(...hitScores);
+  if (spread <= 0) return dominated;
+
+  const familyBestScore = new Map<string, number>();
+  for (const row of hitRows) {
+    const score = scoreByParentId.get(row.id);
+    if (score === undefined) continue;
+    const prefixInfo = deriveSiblingPrefix(getN2Header(row));
+    if (!prefixInfo) continue; // itens de nivel 1 nao tem familia de irmaos
+    const key = siblingFamilyKey(row, prefixInfo.parentPrefix, prefixInfo.level);
+    const prevBest = familyBestScore.get(key);
+    if (prevBest === undefined || score < prevBest) familyBestScore.set(key, score);
+  }
+
+  const threshold = SIBLING_HIT_DOMINANCE_FRACTION * spread;
+  for (const row of hitRows) {
+    const score = scoreByParentId.get(row.id);
+    if (score === undefined) continue;
+    const prefixInfo = deriveSiblingPrefix(getN2Header(row));
+    if (!prefixInfo) continue;
+    const key = siblingFamilyKey(row, prefixInfo.parentPrefix, prefixInfo.level);
+    const best = familyBestScore.get(key);
+    if (best !== undefined && score - best > threshold) dominated.add(row.id);
+  }
+
+  return dominated;
+}
+
 export function rankByProvenance(
-  parents:        ParentChunkRow[],
-  provenanceById: Map<string, Set<Provenance>>,
+  parents:         ParentChunkRow[],
+  provenanceById:  Map<string, Set<Provenance>>,
+  scoreByParentId: Map<string, number> = new Map(),
 ): RankedParent[] {
+  const dominatedHitIds = findDominatedSiblingHits(parents, provenanceById, scoreByParentId);
+
   const classified: RankedParent[] = parents.map((row) => {
     const prov = provenanceById.get(row.id);
     // Sem proveniencia conhecida: conservador — mantem como central (nao rebaixa
     // o que nao conseguimos explicar, preservando recall).
-    const isCentral = !prov || prov.has('HIT') || prov.has('DESCENDANT');
+    const isCentral =
+      (!prov || prov.has('HIT') || prov.has('DESCENDANT')) &&
+      !dominatedHitIds.has(row.id);
     return {
       row,
       role: (isCentral ? 'PRINCIPAL' : 'COMPLEMENTAR') as RankedParent['role'],
@@ -426,33 +601,81 @@ export function expandWithNeighbors(
 // ---------------------------------------------------------------------------
 // flattenClusters
 //
-// Converte a lista de clusters em uma lista plana de ParentChunkRows,
-// preservando a ordem dos clusters e, dentro de cada cluster, a ordem
-// dos parents.
+// Converte a lista de clusters em uma lista plana de ParentChunkRows.
 //
-// Aplica deduplicação global (um parent pode aparecer em apenas um cluster)
-// e respeita MAX_EXPANDED_PARENTS e MAX_EXPANDED_CHARS.
+// SELECAO round-robin, EMISSAO por cluster: quando os tetos apertam, a escolha
+// de quem sobrevive percorre os clusters em rodadas (um parent de cada cluster
+// por rodada, na ordem do boost) — assim TODA faceta recuperada garante ao
+// menos um representante antes de qualquer cluster aprofundar. A selecao
+// cluster-major anterior gastava o teto inteiro nos primeiros clusters e
+// cortava os da cauda por completo, exatamente os escopos complementares de
+// uma pergunta transversal (corpo da norma + anexos + contrato).
+// A EMISSAO final preserva a ordem por cluster (e, dentro dele, a ordem
+// estrutural ja estabelecida), mantendo a leitura continua de cada dispositivo
+// no prompt.
+//
+// Aplica deduplicação global (por id e por assinatura de conteudo) e respeita
+// MAX_EXPANDED_PARENTS e MAX_EXPANDED_CHARS.
+//
+// `selectionPriority` (opcional): ordena a FILA de cada cluster para a
+// selecao (menor = mais prioritario), sem alterar a ordem de emissao. Uso: dar
+// precedencia a HITs sobre irmaos de expansao quando o teto aperta — sem isso,
+// um irmao trazido por vizinhanca podia consumir a vaga de um acerto direto do
+// retriever no mesmo cluster (a clausula 12.8, hit direto, chegou a ser
+// cortada enquanto os irmaos 12.3/12.6 entravam). A ordenacao e estavel:
+// dentro da mesma prioridade permanece a ordem estrutural.
 // ---------------------------------------------------------------------------
-export function flattenClusters(clusters: RetrievalCluster[]): ParentChunkRow[] {
+export function flattenClusters(
+  clusters: RetrievalCluster[],
+  selectionPriority?: (row: ParentChunkRow) => number,
+): ParentChunkRow[] {
   const seen      = new Set<string>();
   const seenSig   = new Set<string>();
-  const result:   ParentChunkRow[] = [];
+  const selected  = new Set<string>();
   let totalChars  = 0;
+  let totalCount  = 0;
 
-  for (const cluster of clusters) {
-    for (const row of cluster.parents) {
-      const signature = contentSignature(row);
-      if (seen.has(row.id) || seenSig.has(signature)) continue;
-      if (result.length >= MAX_EXPANDED_PARENTS) break;
-      if (totalChars + row.content.length > MAX_EXPANDED_CHARS) continue;
+  // Fila por cluster, consumida em rodadas. A fila pode ser reordenada por
+  // prioridade de selecao; a emissao final ignora essa ordem.
+  const queues = clusters.map((c) => ({
+    rows: selectionPriority
+      ? [...c.parents].sort((a, b) => selectionPriority(a) - selectionPriority(b))
+      : c.parents,
+    next: 0,
+  }));
 
-      seen.add(row.id);
-      seenSig.add(signature);
-      result.push(row);
-      totalChars += row.content.length;
+  let progressed = true;
+  while (progressed && totalCount < MAX_EXPANDED_PARENTS) {
+    progressed = false;
+    for (const queue of queues) {
+      if (totalCount >= MAX_EXPANDED_PARENTS) break;
+      // Avanca na fila do cluster ate conseguir selecionar UM parent valido
+      // nesta rodada (pulando duplicatas e candidatos acima do orcamento).
+      while (queue.next < queue.rows.length) {
+        const row = queue.rows[queue.next++];
+        const signature = contentSignature(row);
+        if (seen.has(row.id) || seenSig.has(signature)) continue;
+        seen.add(row.id);
+        seenSig.add(signature);
+        if (totalChars + row.content.length > MAX_EXPANDED_CHARS) continue;
+        selected.add(row.id);
+        totalChars += row.content.length;
+        totalCount++;
+        progressed = true;
+        break;
+      }
     }
-    if (result.length >= MAX_EXPANDED_PARENTS) break;
   }
 
+  // Emissao por cluster, filtrada aos selecionados — grupos continuam contiguos.
+  const result: ParentChunkRow[] = [];
+  for (const cluster of clusters) {
+    for (const row of cluster.parents) {
+      if (selected.has(row.id)) {
+        selected.delete(row.id); // dedup de emissao caso o mesmo id aparecesse em 2 clusters
+        result.push(row);
+      }
+    }
+  }
   return result;
 }

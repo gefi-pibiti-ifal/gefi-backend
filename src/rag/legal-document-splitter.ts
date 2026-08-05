@@ -2,7 +2,17 @@
 // Regex de transição de estado — nível 1 (estrutura do documento)
 // Cada padrão ancora no início da linha (^)
 // ---------------------------------------------------------------------------
-const RE_ANEXO    = /^ANEXO\s+([A-Z0-9][A-Z0-9\-]*)/i;
+// ANEXO e propositalmente CASE-SENSITIVE: cabecalhos de anexo em documentos
+// normativos brasileiros sao tipografados em caixa alta ("ANEXO VIII-B"),
+// enquanto REFERENCIAS em prosa usam caixa mista/baixa ("anexo do Edital.",
+// "Anexo V-B, ou outro instrumento..."). Com /i, uma referencia que caia no
+// inicio de linha (quebra de linha do PDF) dispara uma transicao de estado
+// falsa e todo o resto do documento e rotulado com um anexo fantasma
+// (observado no corpus: n1_header "ANEXO DO" contaminando 21 de 22 parents
+// de um contrato). Os demais niveis (Secao, Capitulo) mantem /i porque seus
+// cabecalhos legitimos SAO em caixa mista ("Seção I") — e nenhuma captura de
+// prosa desses padroes foi observada no corpus.
+const RE_ANEXO    = /^ANEXO\s+([A-Z0-9][A-Z0-9\-]*)/;
 const RE_CAPITULO = /^CAP[ÍI]TULO\s+([IVXLCDM]+)/i;
 const RE_SECAO    = /^Se[çc][ãa]o\s+([IVXLCDM]+)/i;
 const RE_SUBSECAO = /^Subse[çc][ãa]o\s+([IVXLCDM]+)/i;
@@ -16,8 +26,11 @@ const RE_LIVRO    = /^LIVRO\s+([IVXLCDM]+)/i;
 // Prefixo multi-nível:  "10.2.", "3.5", "2.1.", "10.2.1."
 const RE_ITEM_PREFIX_MULTI  = /^(\d+\.\d+(?:\.\d+)*\.?)/;
 // Prefixo nível único:  "1.", "2."  — ponto obrigatório para não confundir
-// com números soltos no meio de frases ("item 3 do contrato")
-const RE_ITEM_PREFIX_SINGLE = /^(\d+\.)/;
+// com números soltos no meio de frases ("item 3 do contrato").
+// Tolera UM espaço entre o número e o ponto ("1 . CLÁUSULA PRIMEIRA") —
+// artefato comum de extração de PDF em termos de contrato; a forma canônica
+// é restaurada em extractItemHeader.
+const RE_ITEM_PREFIX_SINGLE = /^(\d+ ?\.)/;
 // Prefixo de artigo: "Art. 10", "Art.10°", "Art. 66-A", "Art 47", "Art. 5º"
 const RE_ARTIGO_PREFIX = /^Art\.?\s*\d+[\-\w°º]*/i;
 
@@ -96,36 +109,27 @@ export function isValidTitleSuffix(afterPrefix: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// looksLikeHeading
+// [REMOVIDO] looksLikeHeading
 //
-// Complementa isValidTitleSuffix com reconhecimento de padrões estruturais
-// específicos de documentos normativos brasileiros.
+// A segunda camada de "reconhecimento positivo de titulo" foi removida da
+// decisao de fronteira. Motivo: itens numerados de documentos juridicos NAO
+// tem forma de titulo — o texto apos o numero e prosa normativa comum, e a
+// allowlist de padroes rejeitava sistematicamente aberturas legitimas:
+//   "3.1. O prazo de vigencia..."      (maiuscula isolada + espaco)
+//   "2.1. A presente contratacao..."   (idem)
+//   "9. E permitida a licitacao:"      (idem, acentuada)
+//   "3. CLAUSULA TERCEIRA – VIGENCIA"  (caixa alta)
+// Medido no corpus real: 30% das fronteiras da IN 05 e 48% das fronteiras de
+// um termo de contrato eram descartadas por essa camada, fundindo clausulas
+// inteiras num mesmo ParentChunk (ex.: tabela de precos + clausula de
+// fundamento legal + clausula de vigencia num unico blob).
 //
-// Aceita explicitamente:
-//   - Palavras que iniciam títulos de seções (Fiscalização, Avaliação, ...)
-//   - Marcadores estruturais (§, Parágrafo único, Inciso, Alínea)
-//   - Numerais romanos isolados (I, II, III, IV, V, ...)
-//   - Cabeçalhos de nível 1 (CAPÍTULO, SEÇÃO, SUBSEÇÃO, ANEXO)
-//
-// Esta função é chamada sobre o sufixo (texto após o prefixo numérico),
-// já validado por isValidTitleSuffix. Ela adiciona uma segunda camada de
-// confirmação para casos ambíguos.
+// A decisao continua protegida pelas camadas restantes:
+//   - isLegislativeReferenceLine  (guard explicita de referencias a leis)
+//   - isValidTitleSuffix          (rejeita ",", "/", "de 1993", "no 8.666")
+//   - isSequentialItem            (coerencia numerica com o estado corrente,
+//                                  incluindo guard de numero de lei N.NNN)
 // ---------------------------------------------------------------------------
-const RE_STRUCTURAL_MARKERS = [
-  /^[.\s]*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ][a-záéíóúâêîôûãõç]/,  // Palavra com inicial maiúscula seguida de minúscula
-  /^[.\s]*[a-záéíóúâêîôûãõç]{3,}/,                  // Palavra minúscula com 3+ letras (preposições: "das", "do", "no")
-  /^[.\s]*§/,                                         // Parágrafo (§)
-  /^[.\s]*(I{1,3}|IV|VI{0,3}|IX|X{1,3})\b/,         // Numerais romanos I–XIII
-  /^[.\s]*Par[aá]grafo\s+[uú]nico/i,                 // "Parágrafo único"
-  /^[.\s]*Inciso\b/i,                                 // "Inciso"
-  /^[.\s]*Al[ií]nea\b/i,                              // "Alínea"
-  /^[.\s]*(CAP[ÍI]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O|ANEXO|T[ÍI]TULO|LIVRO)\b/i,
-];
-
-export function looksLikeHeading(suffix: string): boolean {
-  if (!suffix) return false;
-  return RE_STRUCTURAL_MARKERS.some(re => re.test(suffix));
-}
 
 // ---------------------------------------------------------------------------
 // isSequentialItem
@@ -134,25 +138,36 @@ export function looksLikeHeading(suffix: string): boolean {
 // plausível. Bloqueia apenas retrocessos absurdos — não exige sequência
 // estrita (aceita saltos de irmão como 10.2 → 10.5).
 //
+// A comparação é GENÉRICA em profundidade: mesmo nível e subida de nível são
+// decididos comparando os componentes comuns dos dois números — a transição é
+// válida quando o primeiro componente divergente AVANÇA. As regras antigas,
+// codificadas apenas para nível 2, rejeitavam TODA transição de irmãos em
+// profundidade >= 3 (3.1.1 → 3.1.2 retornava false), fundindo os subitens de
+// uma cláusula num único ParentChunk (observado no corpus: o parent "3.2.1."
+// de um contrato absorvia 3.2.2 a 3.2.11, 3.3 e 3.4).
+//
 // Aceita:
-//   10.2 → 10.3    próximo irmão
-//   10.2 → 10.5    salto de irmão (seções podem ser omitidas no documento)
-//   10.2 → 10.2.1  primeiro filho
-//   10.5 → 11.1    nova seção
-//   3.5  → 4.1     reinício de seção
-//   1    → 2       nível único sequencial
-//   1    → 3       nível único com salto
-//   1    → 1.1     nível único → filho
+//   10.2   → 10.3     próximo irmão
+//   10.2   → 10.5     salto de irmão (seções podem ser omitidas no documento)
+//   10.2   → 10.2.1   primeiro filho
+//   3.1.1  → 3.1.2    próximo irmão em profundidade 3
+//   3.1.6  → 3.2.1    novo bloco em profundidade 3
+//   3.2.11 → 3.3      subida de nível
+//   10.5   → 11.1     nova seção
+//   1      → 2        nível único sequencial
+//   1      → 1.1      nível único → filho
 //
 // Rejeita:
-//   10.2 → 8.666   retrocesso de seção (8 < 10)
-//   10.2 → 14.133  salto de seção absurdo (14 > 10+3)
-//   5.1  → 1.2     retrocesso de seção
-//   3.5  → 999.999 salto impossível
-//   10.2 → 10.1    retrocesso de item
-//   2    → 1       retrocesso de nível único
+//   10.2 → 8.666     número de lei (segundo componente > MAX_MINOR_COMPONENT)
+//   10.2 → 14.133    número de lei
+//   5.1  → 1.2       retrocesso de seção
+//   10.2 → 10.1      retrocesso de item
+//   2    → 1         retrocesso de nível único
+//   17   → 2024      salto absurdo (> MAX_MAJOR_JUMP) — ano/valor em prosa
+//   10.2 → 10.2.1.1  descida de mais de um nível de uma vez
 //
-// Se `current` for vazio ou não-numérico, aceita qualquer candidato.
+// Se `current` for vazio ou não-numérico, aceita qualquer candidato numérico
+// que não tenha forma de número de lei.
 // ---------------------------------------------------------------------------
 
 // Limiar máximo de salto permitido no componente principal (ex: 10 → 13 ok, 10 → 50 não)
@@ -165,55 +180,58 @@ export function isSequentialItem(current: string, candidate: string): boolean {
   const cand = parseItemNumber(candidate);
   if (!cand) return false;
 
+  const cn = cand.numbers;
+
+  // Guard de número de lei: candidato de DOIS componentes com segundo
+  // componente alto ("8.666", "14.133", "10.520") tem forma de número de
+  // norma, nunca de item estrutural — independe do estado corrente.
+  if (cn.length === 2 && cn[1] > MAX_MINOR_COMPONENT) return false;
+
   if (!current) return true;
 
   const curr = parseItemNumber(current);
   if (!curr) return true; // estado não-numérico (ex: "Art. 5"): aceita qualquer item
 
-  const cn = cand.numbers;
   const cr = curr.numbers;
 
   // --- Candidato de nível único ---
   // Aceita tanto nível único → nível único quanto multi-nível → nível único,
-  // desde que haja avanço numérico no componente principal.
-  // Ex: 10.2.1. → 11.  (cn[0]=11 > cr[0]=10) ✓
-  //     10.2.1. →  9.  (cn[0]=9  < cr[0]=10) ✗
+  // desde que haja avanço numérico plausível no componente principal.
+  // Ex: 10.2.1. → 11.  (11 > 10, salto 1)  ✓
+  //     10.2.1. →  9.  (9 < 10)            ✗
+  //     17.     → 2024. (salto 2007)       ✗  (ano/valor em prosa)
   if (cn.length === 1) {
-    return cn[0] > cr[0];
+    return cn[0] > cr[0] && cn[0] <= cr[0] + MAX_MAJOR_JUMP;
   }
   // Estado de nível único, candidato multi-nível:
   //   - filho direto: cn[0] === cr[0]  (ex: 10. → 10.1, 3. → 3.1)
   //   - novo bloco:   cn[0] >  cr[0]  (ex: 1.  → 2.1,  9. → 10.1)
-  if (cr.length === 1) return cn[0] >= cr[0];
+  if (cr.length === 1) {
+    return cn[0] >= cr[0] && cn[0] <= cr[0] + MAX_MAJOR_JUMP;
+  }
 
-  const [cMaj, cMin] = cr;
-  const [nMaj, nMin] = cn;
-
-  // Filho direto: prefixo do pai presente, último componente = 1
+  // Filho direto: prefixo do estado presente e último componente = 1
+  // (10.2 → 10.2.1 | 3.1 → 3.1.1). Vale para qualquer profundidade.
   if (cn.length === cr.length + 1) {
     const parentMatches = cr.every((v, i) => cn[i] === v);
     return parentMatches && cn[cn.length - 1] === 1;
   }
 
-  // Mesmo nível de dois componentes
-  if (cn.length === 2 && cr.length === 2) {
-    if (nMin > MAX_MINOR_COMPONENT) return false;           // segundo componente de lei (ex: 8.666)
-    if (nMaj < cMaj) return false;                          // retrocesso de seção
-    if (nMaj > cMaj + MAX_MAJOR_JUMP) return false;         // salto absurdo
-    if (nMaj === cMaj) return nMin > cMin;                  // mesmo bloco, avança
-    return true;                                            // novo bloco (nMaj > cMaj)
-  }
+  // Descida de mais de um nível de uma vez (10.2 → 10.2.1.1): implausível.
+  if (cn.length > cr.length + 1) return false;
 
-  // Subindo de nível: candidato mais raso que o estado atual
-  if (cn.length < cr.length && cn.length === 2) {
-    if (nMin > MAX_MINOR_COMPONENT) return false;           // segundo componente de lei
-    if (nMaj < cMaj) return false;
-    if (nMaj > cMaj + MAX_MAJOR_JUMP) return false;
-    if (nMaj === cMaj) return nMin > cMin;
+  // Mesmo nível ou subida de nível (candidato até a profundidade do estado):
+  // compara os componentes comuns; a transição é válida quando o PRIMEIRO
+  // componente divergente AVANÇA (retrocesso rejeitado), com salto limitado
+  // no componente principal. Componentes após o divergente reiniciam
+  // livremente (3.1.6 → 3.2.1).
+  for (let i = 0; i < cn.length; i++) {
+    if (cn[i] === cr[i]) continue;
+    if (cn[i] < cr[i]) return false;                             // retrocesso
+    if (i === 0 && cn[0] > cr[0] + MAX_MAJOR_JUMP) return false; // salto absurdo
     return true;
   }
-
-  return false;
+  return false; // componentes comuns todos iguais: não há avanço
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +265,13 @@ export function isLegislativeReferenceLine(line: string): boolean {
 //   1. Artigo?                    → true   (nunca são referências no início de linha)
 //   2. Prefixo numérico presente? → false se ausente
 //   3. Sufixo parece título?      → false se não (isValidTitleSuffix)
-//   4. Sufixo tem marcadores?     → false se não (looksLikeHeading)
-//   5. Transição coerente?        → false se incompatível (isSequentialItem)
+//   4. Transição coerente?        → false se incompatível (isSequentialItem)
 //   → true
+//
+// NÃO há reconhecimento positivo do "formato de título" do sufixo: o texto
+// após o número de um item jurídico é prosa normativa comum ("O prazo de
+// vigência...", "CLÁUSULA TERCEIRA..."), e qualquer allowlist de formas
+// rejeita aberturas legítimas (ver nota [REMOVIDO] looksLikeHeading acima).
 //
 // Se retornar false, a linha é acumulada no buffer atual — sem perda de conteúdo.
 // ---------------------------------------------------------------------------
@@ -266,7 +288,6 @@ export function isStructuralItem(line: string, currentArtigoItem = ''): boolean 
     const prefix      = multiMatch[0];
     const afterPrefix = line.slice(prefix.length);
     if (!isValidTitleSuffix(afterPrefix)) return false;
-    if (!looksLikeHeading(afterPrefix))   return false;
     if (!isSequentialItem(currentArtigoItem, prefix)) return false;
     return true;
   }
@@ -277,7 +298,18 @@ export function isStructuralItem(line: string, currentArtigoItem = ''): boolean 
     const prefix      = singleMatch[0];
     const afterPrefix = line.slice(prefix.length);
     if (!isValidTitleSuffix(afterPrefix)) return false;
-    if (!looksLikeHeading(afterPrefix))   return false;
+    // Estado de ARTIGO: enumeracoes internas do proprio artigo usam numeracao
+    // decimal de nivel unico CONTINUANDO a frase em minuscula ("1. do limite
+    // de idade da crianca...; e"). Nesse estado, so abre grupo novo se o
+    // sufixo comecar em maiuscula (titulo/caput de secao numerada, ex.:
+    // "1. Introducao"). Fora do estado de artigo a numeracao decimal e a
+    // propria espinha estrutural do documento e o guard nao se aplica.
+    if (
+      RE_ARTIGO_PREFIX.test(currentArtigoItem) &&
+      !/^[.\s]*[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ]/.test(afterPrefix)
+    ) {
+      return false;
+    }
     if (!isSequentialItem(currentArtigoItem, prefix)) return false;
     return true;
   }
@@ -295,7 +327,9 @@ export function extractItemHeader(line: string): string {
   if (RE_ARTIGO_PREFIX.test(line)) return line.match(RE_ARTIGO_PREFIX)![0];
   const multi = line.match(RE_ITEM_PREFIX_MULTI);
   if (multi) return multi[0];
-  return line.match(RE_ITEM_PREFIX_SINGLE)![0];
+  // O prefixo de nível único pode carregar o espaço de artefato de PDF
+  // ("2 ."); normaliza para a forma canônica ("2.") antes de virar n2_header.
+  return line.match(RE_ITEM_PREFIX_SINGLE)![0].replace(/\s+/g, '');
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +423,7 @@ export function splitLegalDocument(cleanedText: string): HierarchicalChunk[] {
     // Se há um prefixo pendente da linha anterior, testa se esta linha
     // é o sufixo do cabeçalho.
     if (pendingPrefix) {
-      if (isValidTitleSuffix(line) && looksLikeHeading(line) &&
+      if (isValidTitleSuffix(line) &&
           isSequentialItem(currentArtigoItem, pendingPrefix)) {
         // Confirma a transição: as duas linhas formam um cabeçalho
         flush();

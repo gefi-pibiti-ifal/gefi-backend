@@ -5,6 +5,8 @@ import {
   snapWindowEnd,
   buildRagPrompt,
   buildSourceLabel,
+  normalizeDocumentTitle,
+  SECTION_HEADER_FALLBACK,
   buildChunkEmbedText,
   stripInvisibleArtifacts,
   dehyphenateAttested,
@@ -400,6 +402,81 @@ describe('findAnchorIndex (implementacao real da janela deslizante)', () => {
 // snapWindowStart / snapWindowEnd — ajuste das bordas da janela para
 // fronteiras de sentenca/linha (evita cortar dispositivos no meio da frase)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Janela deslizante multi-ancora — regressao do Art. 75 da Lei 14.133.
+// Quando o retriever encontra VARIAS regioes do mesmo dispositivo, a janela
+// precisa cobrir da primeira a ultima; ancorar so no melhor child truncava o
+// artigo e derrubava os paragrafos que a pergunta exigia.
+// Replica a logica de retrieveParentContexts para teste isolado.
+// ---------------------------------------------------------------------------
+describe('janela deslizante — cobertura de multiplos trechos recuperados', () => {
+  const SW_BEFORE = 1200;
+  const SW_AFTER = 2400;
+
+  function janela(parent: string, children: string[]): string {
+    let first = Infinity;
+    let lastEnd = -Infinity;
+    for (const child of children) {
+      const idx = findAnchorIndex(parent, child);
+      if (idx === -1) continue;
+      first = Math.min(first, idx);
+      lastEnd = Math.max(lastEnd, idx + child.length);
+    }
+    if (!Number.isFinite(first)) return parent;
+    let start = Math.max(0, first - SW_BEFORE);
+    let end = Math.min(parent.length, lastEnd + SW_AFTER);
+    start = snapWindowStart(parent, start);
+    end = snapWindowEnd(parent, end);
+    return parent.substring(start, end);
+  }
+
+  // Artigo longo: cabeca com o limite, corpo extenso e cauda com o paragrafo.
+  // Cada sentenca do meio e unica — texto repetido faria o anchor casar sempre
+  // na primeira ocorrencia e mediria o fixture, nao a janela.
+  const CABECA = 'Art. 75. E dispensavel a licitacao: I - valores inferiores a R$ 100.000,00 (cem mil reais). ';
+  const MEIO = Array.from(
+    { length: 60 },
+    (_, i) => `Inciso ${i + 1} do artigo, com redacao propria e distinta das demais para ancoragem.`,
+  ).join(' ') + ' ';
+  const CAUDA = 'Paragrafo 2o Os valores serao duplicados para consorcios publicos.';
+  const PARENT = CABECA + MEIO + CAUDA;
+
+  // findAnchorIndex casa a PRIMEIRA ocorrencia do anchor; os trechos abaixo
+  // comecam em texto inequivoco para que a ancoragem seja deterministica.
+  const childCabeca = PARENT.slice(0, 120);
+  const childCauda = PARENT.slice(PARENT.indexOf('Paragrafo 2o'));
+
+  test('dois trechos distantes: a janela cobre do primeiro ao ultimo', () => {
+    const out = janela(PARENT, [childCabeca, childCauda]);
+    expect(out).toContain('100.000,00');
+    expect(out).toContain('duplicados para consorcios');
+  });
+
+  test('ancorar apenas no primeiro trecho perderia a cauda (comportamento antigo)', () => {
+    const soPrimeiro = janela(PARENT, [childCabeca]);
+    expect(soPrimeiro).toContain('100.000,00');
+    expect(soPrimeiro).not.toContain('duplicados para consorcios');
+  });
+
+  test('a ordem dos trechos nao altera a janela resultante', () => {
+    expect(janela(PARENT, [childCauda, childCabeca])).toBe(
+      janela(PARENT, [childCabeca, childCauda]),
+    );
+  });
+
+  test('um unico trecho continua produzindo a janela centrada nele', () => {
+    const meio = PARENT.slice(3000, 3120);
+    const out = janela(PARENT, [meio]);
+    expect(out.length).toBeLessThan(PARENT.length);
+    expect(out).toContain(meio.slice(0, 40));
+  });
+
+  test('trechos sem anchor localizavel nao quebram a janela', () => {
+    const out = janela(PARENT, ['XYZ conteudo inexistente no parent aqui']);
+    expect(out).toBe(PARENT);
+  });
+});
+
 describe('snapWindowStart / snapWindowEnd', () => {
   test('start recua para o inicio da sentenca corrente', () => {
     const content = 'Primeira sentenca completa. Segunda sentenca que sera cortada no meio.';
@@ -473,7 +550,49 @@ describe('buildChunkEmbedText', () => {
   });
 });
 
+describe('normalizeDocumentTitle', () => {
+  test('remove segmento repetido de titulo exportado (artefato de upload)', () => {
+    expect(
+      normalizeDocumentTitle(
+        'LEI Nº 14.133, DE 1º DE ABRIL DE 2021 - LEI Nº 14.133, DE 1º DE ABRIL DE 2021 - DOU - Imprensa Nacional',
+      ),
+    ).toBe('LEI Nº 14.133, DE 1º DE ABRIL DE 2021 - DOU - Imprensa Nacional');
+  });
+
+  test('deduplica ignorando acento e caixa', () => {
+    expect(normalizeDocumentTitle('Instrucao Normativa 5 - INSTRUÇÃO NORMATIVA 5 - DOU')).toBe(
+      'Instrucao Normativa 5 - DOU',
+    );
+  });
+
+  test('titulo sem separador passa inalterado', () => {
+    expect(normalizeDocumentTitle('CONTRATO_N_06_2024-REITORIA')).toBe('CONTRATO_N_06_2024-REITORIA');
+  });
+
+  test('titulo com segmentos distintos e preservado por completo', () => {
+    expect(normalizeDocumentTitle('INSTRUÇÃO NORMATIVA Nº 5, DE 26 DE MAIO DE 2017 - Imprensa Nacional')).toBe(
+      'INSTRUÇÃO NORMATIVA Nº 5, DE 26 DE MAIO DE 2017 - Imprensa Nacional',
+    );
+  });
+
+  test('preserva a ordem dos segmentos mantidos', () => {
+    expect(normalizeDocumentTitle('A - B - A - C')).toBe('A - B - C');
+  });
+});
+
 describe('buildSourceLabel', () => {
+  test('o rotulo usa o titulo normalizado (sem segmento repetido)', () => {
+    const doc = makeDoc({
+      title: 'LEI Nº 14.133, DE 2021 - LEI Nº 14.133, DE 2021 - DOU',
+      n1_header: 'CAPÍTULO I',
+      n2_header: 'Art. 95',
+      sectionHeader: 'Art. 95',
+    });
+    expect(buildSourceLabel(doc, 0)).toBe(
+      '[Trecho 1] Documento: "LEI Nº 14.133, DE 2021 - DOU" | CAPÍTULO I | Art. 95',
+    );
+  });
+
   test('rotulo completo: titulo + anexo + item', () => {
     const doc = makeDoc({
       title: 'Edital de Credenciamento 2026',
@@ -511,6 +630,20 @@ describe('buildSourceLabel', () => {
   test('metadados ausentes nao quebram o rotulo', () => {
     const doc = makeDoc({});
     expect(buildSourceLabel(doc, 0)).toBe('[Trecho 1] Documento: "Documento sem titulo"');
+  });
+
+  test('preambulo do documento nao vira "Item Secao" (rotulo sintetico da ingestao)', () => {
+    // grupo de preambulo: sem anexo e sem item — o sectionHeader e o fallback
+    const doc = makeDoc({
+      title: 'CONTRATO_N_06_2024-REITORIA',
+      n1_header: '',
+      n2_header: '',
+      sectionHeader: SECTION_HEADER_FALLBACK,
+    });
+    expect(buildSourceLabel(doc, 0)).toBe(
+      '[Trecho 1] Documento: "CONTRATO_N_06_2024-REITORIA"',
+    );
+    expect(buildSourceLabel(doc, 0)).not.toContain('Item');
   });
 
   test('role interno definido no retrieval NAO vaza para o rotulo', () => {
@@ -569,7 +702,7 @@ describe('buildRagPrompt', () => {
   });
 
   test('proibe abertura mecanica que descreve o sistema em vez de responder', () => {
-    expect(prompt).toContain('RESPONDA A PERGUNTA, NAO DESCREVA O SISTEMA');
+    expect(prompt).toContain('A RESPOSTA E ORGANIZADA PELA PERGUNTA, NUNCA PELA NORMA');
     // A frase-modelo da versao anterior (meta-descricao do retrieval) sumiu
     expect(prompt).not.toContain(
       'Foram recuperados os seguintes dispositivos relacionados ao tema solicitado',
@@ -578,18 +711,128 @@ describe('buildRagPrompt', () => {
     expect(prompt).not.toContain('MAIS DE UM ITEM NORMATIVO');
   });
 
-  test('define os dois modos de resposta (explicativo e transcricao literal)', () => {
-    expect(prompt).toContain('Pergunta explicativa');
-    expect(prompt).toContain('Pedido de transcricao');
+  test('classifica a pergunta pelos cinco tipos de resposta esperada', () => {
+    expect(prompt).toContain('IDENTIFIQUE O TIPO DE RESPOSTA QUE A PERGUNTA PEDE');
+    expect(prompt).toContain('a) DECISAO');
+    expect(prompt).toContain('b) QUANTIDADE');
+    expect(prompt).toContain('c) IDENTIDADE');
+    expect(prompt).toContain('d) CONJUNTO ou PROCEDIMENTO');
+    expect(prompt).toContain('e) REPRODUCAO');
+    // a classificacao e pelo tipo de informacao, nunca pelas palavras da pergunta
+    expect(prompt).toContain('Nao classifique a pergunta pelas palavras com que ela comeca');
     expect(prompt).toContain('nao resuma, nao reorganize, nao omita e nao acrescente nada');
     expect(prompt).toContain('nao copie secoes inteiras da norma');
   });
 
-  test('sinaliza ordenacao por pertinencia e cita a fonte no titulo do topico', () => {
+  // -------------------------------------------------------------------------
+  // Modo direto — regressao do caso real: "Posso fazer um contrato verbal...?
+  // Existe algum limite de valor?" respondia como resumo da norma ("A
+  // legislacao permite...") com um bloco por dispositivo, sem dizer "Sim/Nao"
+  // nem destacar o limite de R$ 10.000,00 na abertura.
+  // -------------------------------------------------------------------------
+  describe('resposta pontual (abertura tipada por tipo de pergunta)', () => {
+    test('o tipo vem da pergunta, nao do volume recuperado', () => {
+      expect(prompt).toContain('decida ANTES de escrever');
+      expect(prompt).toContain('O tipo vem do que foi PERGUNTADO, nunca do volume do que foi recuperado');
+      expect(prompt).toContain('DESEMPATE com (d)');
+      // um contexto grande nao promove pergunta pontual a procedimental
+      expect(prompt).toContain('nao transforma uma pergunta de quantidade em pergunta de conjunto');
+    });
+
+    test('cada tipo pontual tem a sua forma de abertura', () => {
+      expect(prompt).toContain('A PRIMEIRA PALAVRA ja pertence ao tipo de resposta pedido');
+      expect(prompt).toContain('DECISAO: abra pela propria decisao');
+      expect(prompt).toContain('QUANTIDADE: abra pelo numero com a sua unidade');
+      expect(prompt).toContain('IDENTIDADE: abra pela designacao exata, reproduzida como consta no trecho');
+      // nada precede a resposta
+      expect(prompt).toContain('NADA precede a resposta');
+      expect(prompt).toContain('Quem ler apenas a abertura ja sabe o que fazer');
+    });
+
+    test('pergunta composta responde todos os tipos na abertura, sem virar procedimental', () => {
+      expect(prompt).toContain('PERGUNTA COMPOSTA');
+      expect(prompt).toContain('e DECISAO + QUANTIDADE');
+      expect(prompt).toContain('Ter duas partes nao transforma a pergunta em (d)');
+    });
+
+    test('exige resposta na primeira linha, sem preambulo sobre a norma', () => {
+      expect(prompt).toContain('a primeira frase contem a RESPOSTA');
+      // aberturas que descrevem a norma em vez de responder ficam proibidas
+      expect(prompt).toContain('A legislacao permite...');
+      expect(prompt).toContain('A norma estabelece as diretrizes...');
+    });
+
+    test('define as partes da resposta pontual na ordem abertura -> desenvolvimento -> fundamentacao', () => {
+      expect(prompt).toContain('ESTRUTURA DA RESPOSTA PONTUAL');
+      const abertura = prompt.indexOf('1) ABERTURA');
+      const desenvolvimento = prompt.indexOf('2) DESENVOLVIMENTO');
+      const fundamentacao = prompt.indexOf('4) FUNDAMENTACAO');
+      expect(abertura).toBeGreaterThan(-1);
+      expect(abertura).toBeLessThan(desenvolvimento);
+      expect(desenvolvimento).toBeLessThan(fundamentacao);
+      expect(prompt).toContain('## Fundamentacao');
+    });
+
+    test('proibe enumerar procedimento nao perguntado no modo direto', () => {
+      expect(prompt).toContain('NAO enumere requisitos, condicoes de instrucao processual, etapas ou subitens de um procedimento que a pergunta nao pediu');
+      // a centralidade e sinal de recuperacao, nunca ordem de cobertura — e o
+      // ponto que impedia o modelo de parar de enumerar os subitens do proprio
+      // dispositivo que responde
+      expect(prompt).toContain('a marcacao de centralidade e um sinal interno de recuperacao, nunca uma ordem de cobertura');
+      expect(prompt).toContain('diga que existem em UMA frase');
+    });
+
+    test('a fundamentacao cita apenas dispositivos efetivamente usados', () => {
+      expect(prompt).toContain('Cite APENAS os dispositivos de onde saiu algum fato efetivamente afirmado na resposta');
+      expect(prompt).toContain('os subitens que voce corretamente deixou de enumerar');
+    });
+
+    test('o gabarito da referencia usa placeholders, nunca as palavras-modelo literais', () => {
+      expect(prompt).toContain('nunca as palavras-modelo "Anexo Y" ou "Documento Z"');
+      expect(prompt).toContain('nao prefixe o nome do documento com "Documento"');
+    });
+
+    test('escopa explicitamente as regras procedimentais (4, 5B e 6) ao seu tipo', () => {
+      expect(prompt).toContain('As regras 4, 5B e 6 valem SOMENTE aqui');
+      expect(prompt).toContain('SOMENTE no modo procedimental');
+      expect(prompt).toContain('NAO se aplicam a resposta pontual');
+    });
+
+    test('secoes opcionais tem limiar explicito e sao tituladas pela duvida do leitor', () => {
+      expect(prompt).toContain('SECOES OPCIONAIS');
+      // limiar objetivo — evita transformar resposta curta em relatorio
+      expect(prompt).toContain('TRES ou mais pontos distintos, ou passar de dois paragrafos');
+      expect(prompt).toContain('uma resposta curta com titulos vira um relatorio sobre duas frases');
+      expect(prompt).toContain('## Limite');
+      expect(prompt).toContain('## Excecao');
+      expect(prompt).toContain('## Consequencia');
+      // titular pelo dispositivo continua proibido na resposta pontual
+      expect(prompt).toContain('NUNCA nomeie o dispositivo, a sua finalidade normativa ou a sua numeracao');
+      // e a proibicao de "categorias" do modo procedimental nao vaza para ca
+      expect(prompt).toContain('NAO vale aqui: ela e exclusiva do modo procedimental');
+      // a abertura nunca fica sob titulo
+      expect(prompt).toContain('A abertura (parte 1) nunca fica sob um titulo');
+    });
+
+    test('completude passa a ser medida pela pergunta, nao pelo contexto', () => {
+      expect(prompt).toContain('A completude e medida pelo que a PERGUNTA pede');
+      expect(prompt).toContain('enumerar o procedimento inteiro nao a torna mais completa');
+    });
+
+    test('citacao e sensivel ao tipo (Fundamentacao na pontual, sob o titulo na procedimental)', () => {
+      expect(prompt).toContain('resposta pontual (decisao, quantidade, identidade): agrupada ao final');
+      expect(prompt).toContain('modo procedimental: UMA unica vez por bloco');
+    });
+  });
+
+  test('sinaliza ordenacao por pertinencia e cita a fonte em linha propria abaixo do titulo', () => {
     expect(prompt).toContain('ordenados por pertinencia');
     expect(prompt).toContain('CITACAO DA FONTE');
-    // A origem vai entre parenteses no titulo, nunca num bloco de metadados
-    expect(prompt).toContain('entre parenteses no TITULO');
+    // A origem vive numa linha em negrito sob o titulo, nunca num bloco de
+    // metadados e nunca mais entre parenteses no proprio titulo.
+    expect(prompt).toContain('linha em negrito imediatamente abaixo do titulo');
+    expect(prompt).toContain('**Item X – Anexo Y – Documento Z**');
+    expect(prompt).not.toContain('entre parenteses no TITULO');
     expect(prompt).not.toContain('FONTES AO FINAL');
   });
 
@@ -601,12 +844,33 @@ describe('buildRagPrompt', () => {
     expect(prompt).toContain('COBERTURA COMPLETA DOS DISPOSITIVOS SELECIONADOS');
   });
 
-  test('exige um topico por dispositivo, titulado pela finalidade, sem categorias inventadas', () => {
+  test('exige um bloco por dispositivo, titulado pela finalidade, sem categorias inventadas', () => {
     expect(prompt).toContain('ESTRUTURA E FORMATO');
-    expect(prompt).toContain('um dispositivo por topico');
+    expect(prompt).toContain('um dispositivo por bloco');
     // proibe titulos-fase / categorias inventadas pelo modelo
     expect(prompt).toContain('PROIBIDO transformar dispositivos em fases');
     expect(prompt).toContain('COBERTURA COMPLETA');
+  });
+
+  test('define o contrato de Markdown da resposta (titulo, referencia, listas e espacamento)', () => {
+    expect(prompt).toContain('REGRAS DE MARKDOWN');
+    // titulo de nivel 2 e referencia em negrito em linha propria
+    expect(prompt).toContain('dois sustenidos seguidos de espaco');
+    // marcador de lista obrigatorio: hifen — nunca bullet tipografico
+    expect(prompt).toContain('iniciado por hifen e espaco');
+    expect(prompt).toContain('NUNCA use "•"');
+    // um item por linha, nada de lista em texto corrido
+    expect(prompt).toContain('UM item por linha');
+    expect(prompt).toContain('nunca uma lista escrita em texto corrido');
+    // espacamento entre os elementos do bloco
+    expect(prompt).toContain('deixe UMA linha em branco entre');
+  });
+
+  test('o template de bloco nao usa mais bullet tipografico nem referencia no titulo', () => {
+    // o gabarito antigo ("## N. <Nome> (Item X)" + bullets "•") saiu por completo
+    expect(prompt).not.toContain('• <acao 1>');
+    expect(prompt).toContain('- <acao 1>;');
+    expect(prompt).toContain('## <Nome da atividade / finalidade do dispositivo>');
   });
 
   test('proibe fusao/absorcao entre dispositivos e conta apenas os selecionados', () => {
@@ -647,6 +911,62 @@ describe('buildRagPrompt', () => {
   test('instrui a sinalizar subitem referido cujo texto nao consta dos trechos', () => {
     expect(prompt).toContain('nao consta dos trechos');
   });
+
+  // -------------------------------------------------------------------------
+  // Registro e principio organizador — o que separava a resposta do GeFi
+  // ("parecer juridico resumido") de uma resposta que conversa com o usuario.
+  // -------------------------------------------------------------------------
+  describe('registro conversacional e inversao do principio organizador', () => {
+    test('a persona define a TAREFA (ajudar a decidir), nao o objeto (a norma)', () => {
+      expect(prompt).toContain('Voce ajuda um servidor publico a resolver uma duvida concreta');
+      expect(prompt).toContain('As normas sao a sua FONTE — nunca o roteiro da sua resposta');
+      // a moldura antiga, centrada no objeto, saiu
+      expect(prompt).not.toContain('Voce e um assistente especializado em normas');
+    });
+
+    test('declara explicitamente o caminho certo e o caminho errado', () => {
+      expect(prompt).toContain('Caminho CERTO:  pergunta -> resposta -> explicacao do necessario -> fundamentacao');
+      expect(prompt).toContain('Caminho ERRADO: norma -> resumo do artigo -> resposta implicita');
+      expect(prompt).toContain('a ordem dos assuntos e a ordem em que a pessoa perguntou');
+    });
+
+    test('a secao de LINGUAGEM E REGISTRO define registro institucional impessoal', () => {
+      expect(prompt).toContain('LINGUAGEM E REGISTRO (vale em todos os modos)');
+      expect(prompt).toContain('Registro INSTITUCIONAL e impessoal');
+      expect(prompt).toContain('Nem parecer juridico, nem conversa informal');
+      // segunda pessoa proibida — era o que produzia "voce pode..."
+      expect(prompt).toContain('NAO se dirija ao leitor na segunda pessoa');
+      expect(prompt).toContain('Evite "voce pode", "voce deve"');
+      expect(prompt).toContain('A Administracao podera');
+      // proibe a narracao da norma no corpo
+      expect(prompt).toContain('Fale da ACAO e do seu efeito, nao do texto que a preve');
+      expect(prompt).toContain('o dispositivo estabelece');
+      // jargao explicado com o proprio trecho — grounding preservado
+      expect(prompt).toContain('explique-o na primeira vez com o que o PROPRIO trecho diz');
+      expect(prompt).toContain('Se o trecho nao definir o termo, use-o sem inventar definicao');
+    });
+
+    test('prefere transicoes curtas a condicionais longas', () => {
+      expect(prompt).toContain('Nessa hipotese');
+      expect(prompt).toContain('Acima desse limite');
+      expect(prompt).toContain('Caso o valor do servico venha a ultrapassar o limite estabelecido');
+    });
+
+    test('naturalidade nunca autoriza opiniao nem afrouxar o grounding', () => {
+      expect(prompt).toContain('muda o TOM, nunca o conteudo');
+      expect(prompt).toContain('em caso de duvida entre soar melhor e ser fiel, escolha SEMPRE ser fiel');
+    });
+
+    test('a conferencia final checa abertura tipada, registro e fidelidade', () => {
+      expect(prompt).toContain('CONFERENCIA FINAL (todos os modos)');
+      expect(prompt).toContain('A PRIMEIRA PALAVRA pertence ao tipo pedido');
+      expect(prompt).toContain('virou a ordem dos artigos?');
+      expect(prompt).toContain('Sobrou "voce" dirigido ao leitor');
+      expect(prompt).toContain('sai de algum trecho fornecido?');
+      // titulos so quando ganham a leitura
+      expect(prompt).toContain('transformaram tres frases num relatorio? Na duvida, remova-os');
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -670,6 +990,14 @@ describe('stripInvisibleArtifacts', () => {
   test('expande ligaturas tipograficas de PDF', () => {
     expect(stripInvisibleArtifacts('ﬁscalizacao')).toBe('fiscalizacao');
     expect(stripInvisibleArtifacts('conﬂito')).toBe('conflito');
+  });
+
+  test('expande a pseudo-ligadura "Ɵ" (U+019F) de fontes de termo de contrato para "ti"', () => {
+    expect(stripInvisibleArtifacts('conƟnuado')).toBe('continuado');
+    expect(stripInvisibleArtifacts('garanƟa')).toBe('garantia');
+    expect(stripInvisibleArtifacts('serviços conƟnuados com dedicação exclusiva')).toBe(
+      'serviços continuados com dedicação exclusiva',
+    );
   });
 
   test('texto limpo passa inalterado', () => {
