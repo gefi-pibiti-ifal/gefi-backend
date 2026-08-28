@@ -43,17 +43,53 @@ var __metadata = (this && this.__metadata) || function (k, v) {
 };
 var RagService_1;
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.RagService = void 0;
+exports.RagService = exports.buildCitation = exports.buildSourceLabel = exports.normalizeDocumentTitle = exports.SECTION_HEADER_FALLBACK = void 0;
+exports.normalizeForSearch = normalizeForSearch;
+exports.locationMetadata = locationMetadata;
+exports.findAnchorIndex = findAnchorIndex;
+exports.snapWindowStart = snapWindowStart;
+exports.snapWindowEnd = snapWindowEnd;
+exports.stripInvisibleArtifacts = stripInvisibleArtifacts;
+exports.collectAttestedWords = collectAttestedWords;
+exports.dehyphenateAttested = dehyphenateAttested;
+exports.cleanExtractedText = cleanExtractedText;
+exports.buildChunkEmbedText = buildChunkEmbedText;
+exports.buildRagPrompt = buildRagPrompt;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
+const legal_document_splitter_1 = require("./legal-document-splitter");
+const document_location_1 = require("./document-location");
+const response_sources_1 = require("./response-sources");
+const hierarchical_context_1 = require("./hierarchical-context");
 const google_genai_1 = require("@langchain/google-genai");
-const textsplitters_1 = require("@langchain/textsplitters");
 const documents_1 = require("@langchain/core/documents");
 const embeddings_1 = require("@langchain/core/embeddings");
 const pgvector_1 = require("@langchain/pgvector");
 const generative_ai_1 = require("@google/generative-ai");
 const dotenv = __importStar(require("dotenv"));
+const generative_ai_2 = require("@google/generative-ai");
 dotenv.config();
+const DEBUG_RAG = process.env.DEBUG_RAG === 'true';
+const EMBEDDING_BATCH_SIZE = 15;
+const EMBEDDING_BATCH_DELAY = 10_000;
+const EMBEDDING_RETRY_DELAY = 65_000;
+const EMBEDDING_MAX_RETRIES = 5;
+const RETRIEVAL_FETCH_K = 12;
+const MAX_SIBLINGS_PER_GROUP = 3;
+const MAX_DESCENDANTS_PER_ITEM = 12;
+const MIN_PARENT_CONTENT_LENGTH = 80;
+const SLIDING_WINDOW_MIN_PARENT_LENGTH = 3500;
+const SLIDING_WINDOW_BEFORE = 1200;
+const SLIDING_WINDOW_AFTER = 2400;
+const SLIDING_WINDOW_ANCHOR_SIZES = [50, 40, 30, 20];
+const SENTENCE_SNAP_RANGE = 300;
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+function chunkArray(arr, size) {
+    const batches = [];
+    for (let i = 0; i < arr.length; i += size)
+        batches.push(arr.slice(i, i + size));
+    return batches;
+}
 class NativeGeminiEmbeddings extends embeddings_1.Embeddings {
     model;
     constructor(apiKey) {
@@ -62,15 +98,323 @@ class NativeGeminiEmbeddings extends embeddings_1.Embeddings {
         this.model = genAI.getGenerativeModel({ model: 'gemini-embedding-2' });
     }
     async embedDocuments(texts) {
-        return Promise.all(texts.map((t) => this.embedSingle(t)));
+        const requests = texts.map((text) => ({
+            content: { role: 'user', parts: [{ text }] },
+        }));
+        const response = await this.model.batchEmbedContents({ requests });
+        return response.embeddings.map((e) => e.values);
     }
     async embedQuery(text) {
-        return this.embedSingle(text);
-    }
-    async embedSingle(text) {
         const result = await this.model.embedContent(text);
         return result.embedding.values;
     }
+}
+function isStructuralHeading(line) {
+    return (/^ANEXO\s+[A-Z0-9]/i.test(line) ||
+        /^CAP[ÍI]TULO\s+[IVXLCDM]/i.test(line) ||
+        /^Se[çc][ãa]o\s+[IVXLCDM]/i.test(line) ||
+        /^Subse[çc][ãa]o\s+[IVXLCDM]/i.test(line) ||
+        /^T[ÍI]TULO\s+[IVXLCDM]/i.test(line) ||
+        /^LIVRO\s+[IVXLCDM]/i.test(line));
+}
+const RE_PDF_NOISE_ALLCAPS = [
+    /^(MINISTÉRIO|SECRETARIA|DIRETORIA|DEPARTAMENTO|COORDENAÇÃO|SUBSECRETARIA|SUPERINTENDÊNCIA|GERENCIA|ASSESSORIA)\b/i,
+    /^[A-Z]{2,5}$/,
+    /^(I{1,3}|IV|VI{0,3}|IX|X{1,3}|XI{1,3}|XIV|XV)$/,
+];
+function isPdfNoiseAllCaps(line) {
+    return RE_PDF_NOISE_ALLCAPS.some((re) => re.test(line.trim()));
+}
+function normalizeForSearch(text) {
+    return text.replace(/\s+/g, ' ').trim();
+}
+function locationMetadata(range, pages) {
+    return {
+        ...(range ? { char_start: range.start, char_end: range.end } : {}),
+        ...(pages ? { page_start: pages.page_start, page_end: pages.page_end } : {}),
+    };
+}
+function trace(...args) {
+    if (DEBUG_RAG)
+        console.log(...args);
+}
+function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function findAnchorIndex(parentContent, childContent) {
+    for (const size of SLIDING_WINDOW_ANCHOR_SIZES) {
+        const anchor = childContent.slice(0, size).trim();
+        if (anchor.length < 10)
+            continue;
+        const pattern = new RegExp(escapeRegExp(anchor).replace(/\s+/g, '\\s+'));
+        const match = pattern.exec(parentContent);
+        if (match)
+            return match.index;
+    }
+    return -1;
+}
+function snapWindowStart(content, start) {
+    if (start <= 0)
+        return start;
+    const from = Math.max(0, start - SENTENCE_SNAP_RANGE);
+    const region = content.slice(from, start);
+    const breakAt = Math.max(region.lastIndexOf('\n'), region.lastIndexOf('. '));
+    if (breakAt === -1)
+        return start;
+    const isSentence = region.slice(breakAt, breakAt + 2) === '. ';
+    return from + breakAt + (isSentence ? 2 : 1);
+}
+function snapWindowEnd(content, end) {
+    if (end >= content.length)
+        return end;
+    const region = content.slice(end, Math.min(content.length, end + SENTENCE_SNAP_RANGE));
+    const nl = region.indexOf('\n');
+    const dot = region.indexOf('. ');
+    const stops = [];
+    if (nl !== -1)
+        stops.push(nl);
+    if (dot !== -1)
+        stops.push(dot + 1);
+    if (stops.length === 0)
+        return end;
+    return end + Math.min(...stops);
+}
+const PDF_LIGATURES = [
+    [/ﬀ/g, 'ff'],
+    [/ﬁ/g, 'fi'],
+    [/ﬂ/g, 'fl'],
+    [/ﬃ/g, 'ffi'],
+    [/ﬄ/g, 'ffl'],
+    [/Ɵ/g, 'ti'],
+];
+function stripInvisibleArtifacts(text) {
+    let out = text
+        .replace(/[\u00AD\u200B\u200C\u200D\uFEFF]/g, '')
+        .replace(/\u00A0/g, ' ');
+    for (const [re, expanded] of PDF_LIGATURES)
+        out = out.replace(re, expanded);
+    return out;
+}
+function collectAttestedWords(text) {
+    const words = new Set();
+    for (const token of text.split(/[^\p{L}]+/u)) {
+        if (token.length >= 4)
+            words.add(token.toLowerCase());
+    }
+    return words;
+}
+function dehyphenateAttested(text, vocabulary) {
+    const words = vocabulary ?? collectAttestedWords(text);
+    return text.replace(/(\p{L}{2,})-\n(\p{Ll}{2,})/gu, (match, a, b) => words.has(`${a}${b}`.toLowerCase()) ? `${a}${b}` : match);
+}
+function cleanExtractedText(raw, vocabulary) {
+    const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw), vocabulary);
+    return preprocessed
+        .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
+        .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
+        .replace(/^[A-ZÁÉÍÓÚÂÊÎÔÛÃÕÇ\s\/\-\.]{5,80}$/gm, (match) => {
+        const trimmed = match.trim();
+        if (isStructuralHeading(trimmed))
+            return match;
+        if (/[a-záéíóúâêîôûãõç]/.test(match))
+            return match;
+        if (isPdfNoiseAllCaps(trimmed))
+            return '';
+        return match;
+    })
+        .replace(/[_\-\.]{4,}/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/^[ \t]+|[ \t]+$/gm, '')
+        .trim();
+}
+function resolveFinishReason(response) {
+    return (response?.finishReason ??
+        response?.response_metadata?.finishReason ??
+        response?.response_metadata?.finish_reason ??
+        response?.generationInfo?.finishReason ??
+        response?.generationInfo?.finish_reason ??
+        'unknown');
+}
+var source_citation_1 = require("./source-citation");
+Object.defineProperty(exports, "SECTION_HEADER_FALLBACK", { enumerable: true, get: function () { return source_citation_1.SECTION_HEADER_FALLBACK; } });
+Object.defineProperty(exports, "normalizeDocumentTitle", { enumerable: true, get: function () { return source_citation_1.normalizeDocumentTitle; } });
+Object.defineProperty(exports, "buildSourceLabel", { enumerable: true, get: function () { return source_citation_1.buildSourceLabel; } });
+Object.defineProperty(exports, "buildCitation", { enumerable: true, get: function () { return source_citation_1.buildCitation; } });
+const source_citation_2 = require("./source-citation");
+function buildChunkEmbedText(rawChild, ctx) {
+    const parts = [];
+    if (ctx.title?.trim())
+        parts.push(ctx.title.trim());
+    if (ctx.sectionHeading?.trim())
+        parts.push(ctx.sectionHeading.trim());
+    if (ctx.item?.trim())
+        parts.push(`Item ${ctx.item.trim()}`);
+    const header = parts.join(' — ');
+    return header ? `${header}\n\n${rawChild}` : rawChild;
+}
+function buildRagPrompt(contexts, userQuery) {
+    const isApoio = (doc) => doc.metadata.role === 'COMPLEMENTAR';
+    const central = contexts.filter((d) => !isApoio(d));
+    const apoio = contexts.filter(isApoio);
+    let idx = 0;
+    const render = (doc) => `${(0, source_citation_2.buildSourceLabel)(doc, idx++)}\n${doc.pageContent}`;
+    const centralBlock = central.map(render).join('\n\n---\n\n');
+    const apoioBlock = apoio.map(render).join('\n\n---\n\n');
+    const contextBlock = apoio.length
+        ? `${centralBlock}\n\n=== MATERIAL DE APOIO (dispositivos correlatos trazidos pela expansao; NAO gere bloco proprio para estes — use so para referencia cruzada ou se indispensaveis) ===\n\n${apoioBlock}`
+        : centralBlock;
+    return `Voce ajuda um servidor publico a resolver uma duvida concreta do trabalho dele. Ele nao quer estudar a norma: ele quer saber o que pode fazer, quanto, ate quando, e o que fazer quando a regra nao o alcanca. As normas sao a sua FONTE — nunca o roteiro da sua resposta.
+
+Abaixo estao trechos de documentos normativos, cada um com uma anotacao interna de origem (documento, anexo, item). Os trechos estao ordenados por pertinencia — o primeiro e o mais diretamente relacionado a pergunta — e podem vir separados em dois niveis: DISPOSITIVOS CENTRAIS e MATERIAL DE APOIO (correlato). Eles sao um UNIVERSO DE CONSULTA, nao um roteiro: o numero de trechos recuperados nunca determina o tamanho nem o formato da resposta — quem determina isso e a pergunta (ver IDENTIFIQUE O TIPO DE RESPOSTA). Trechos consecutivos de um mesmo documento e anexo costumam ser partes (itens, subitens, alineas ou incisos) de um mesmo dispositivo; nesse caso formam uma sequencia continua, na ordem original da norma, e devem ser lidos em conjunto, pois juntos compoem a resposta completa. As anotacoes, os rotulos [Trecho N] e o mecanismo de selecao de trechos sao detalhes internos do sistema e nao fazem parte da resposta.
+
+COMO RESPONDER:
+
+1. A RESPOSTA E ORGANIZADA PELA PERGUNTA, NUNCA PELA NORMA
+   Este e o principio que governa todos os outros. O esqueleto da resposta vem da DUVIDA de quem perguntou; a norma entra depois, para sustentar o que voce afirmou.
+   Caminho CERTO:  pergunta -> resposta -> explicacao do necessario -> fundamentacao.
+   Caminho ERRADO: norma -> resumo do artigo -> resposta implicita no meio do resumo.
+   Na pratica isso significa:
+   - a primeira frase contem a RESPOSTA, nunca um preambulo sobre o que a norma dispoe;
+   - a ordem dos assuntos e a ordem em que a pessoa perguntou, nao a ordem dos artigos, itens ou incisos;
+   - se a pergunta tem duas partes ("posso fazer X? ha limite de valor?"), as duas sao respondidas logo na abertura, na mesma ordem;
+   - um dispositivo que nao ajuda a responder nao entra, por mais central que pareca no contexto.
+   Nunca abra comentando os documentos ("Foram recuperados...", "Os dispositivos encontrados...", "O contexto contem...").
+   Nunca abra descrevendo a norma em vez de responder ("A legislacao permite...", "A norma estabelece as diretrizes...", "As regras acerca de X obedecem as seguintes determinacoes...") quando a pergunta admitia um "Sim", um "Nao" ou um numero como primeira palavra.
+   Nunca use na resposta termos internos como "Fonte 1", "Trecho 2", "documento principal", "documento complementar", "contexto recuperado".
+
+2. IDENTIFIQUE O TIPO DE RESPOSTA QUE A PERGUNTA PEDE (decida ANTES de escrever)
+   Nao classifique a pergunta pelas palavras com que ela comeca, e sim pelo TIPO DE INFORMACAO que a completaria. Sao cinco tipos: os tres primeiros mudam apenas COMO A RESPOSTA ABRE; o quarto muda toda a estrutura; o quinto suspende a redacao.
+   a) DECISAO — a resposta e um juizo de permissao, obrigatoriedade ou aplicabilidade: pode/nao pode, e obrigatorio/nao e, aplica-se/nao se aplica, e permitido/e vedado, existe/nao existe — ainda que condicionado a uma excecao ou limite.
+   b) QUANTIDADE — a resposta e um numero com a sua unidade: prazo, valor, limite, percentual, quantidade, data.
+   c) IDENTIDADE — a resposta e a designacao exata de algo ou de alguem: a empresa, o orgao, o contrato, o documento, o instrumento aplicavel, o responsavel.
+   d) CONJUNTO ou PROCEDIMENTO — a resposta e uma serie de elementos ou o encadeamento de uma atividade: rotinas, obrigacoes, requisitos, hipoteses, etapas, prazos ou documentos que compoem um procedimento; ou como executar/compreender uma tarefa administrativa.
+   e) REPRODUCAO — pedido explicito de texto literal ("transcreva...", "copie...", "reproduza...", "mostre na integra...", "texto exato...").
+   Encaminhamento:
+   - (a), (b) e (c) sao RESPOSTAS PONTUAIS -> siga a secao 5A. As tres compartilham a mesma estrutura e diferem somente na forma da ABERTURA (5A.1). NAO use um bloco por dispositivo.
+   - (d) -> siga PENSE EM PROCESSO (secao 4) e a ESTRUTURA E FORMATO do modo procedimental (secao 5B). As regras 4, 5B e 6 valem SOMENTE aqui.
+   - (e) -> reproduza o texto literalmente, completo e na ordem original; mantenha a numeracao e a estrutura originais (itens, subitens, alineas, incisos); nao resuma, nao reorganize, nao omita e nao acrescente nada.
+   PERGUNTA COMPOSTA: uma mesma pergunta pode conter mais de um tipo pontual — "posso fazer X? existe limite de valor?" e DECISAO + QUANTIDADE. A abertura responde TODOS os tipos presentes, na ordem em que foram perguntados. Ter duas partes nao transforma a pergunta em (d).
+   DESEMPATE com (d): a resposta cabe em uma frase mais as suas condicoes? Entao NAO e (d). O tipo vem do que foi PERGUNTADO, nunca do volume do que foi recuperado — um contexto com vinte dispositivos correlatos nao transforma uma pergunta de quantidade em pergunta de conjunto.
+   Em qualquer tipo: preserve com exatidao numeros, prazos, valores, percentuais e obrigacoes; transcreva literalmente apenas passagens curtas em que a redacao exata importa; e nao copie secoes inteiras da norma quando uma sintese fiel responde a pergunta.
+
+3. LINGUAGEM E REGISTRO (vale em todos os modos)
+   Registro INSTITUCIONAL e impessoal — o de um orgao respondendo a uma consulta interna. Nem parecer juridico, nem conversa informal.
+   - NAO se dirija ao leitor na segunda pessoa. Evite "voce pode", "voce deve", "no seu caso", "se voce precisar". Use a forma impessoal ou o sujeito institucional: "E possivel...", "Admite-se...", "Exige-se...", "A Administracao podera...", "O prazo maximo e de...", "A contratacao devera...". Numa pergunta de decisao, "Sim." ou "Nao." sozinho ja e a melhor abertura possivel.
+   - Fale da ACAO e do seu efeito, nao do texto que a preve. Evite "o dispositivo estabelece", "a norma preceitua", "nos termos do referido artigo", "consoante o disposto no item", "conforme estabelece a norma". A origem tem lugar proprio (ver CITACAO DA FONTE) e nao precisa ser repetida a cada frase.
+   - Transicoes curtas que retomam o que ja foi dito, em vez de condicionais longas: prefira "Nessa hipotese", "Nesse caso", "Acima desse limite", "Fora dessa hipotese" a "Caso o valor do servico venha a ultrapassar o limite estabelecido...".
+   - Frases curtas e voz ativa. Prefira "o fiscal deve verificar" a "devera ser procedida a verificacao".
+   - Jargao: use o termo tecnico que a norma usa (ele e a linguagem do servico), mas explique-o na primeira vez com o que o PROPRIO trecho diz. Ex.: "servicos de pronto pagamento (aqueles de valor nao superior a R$ 10.000,00)". Se o trecho nao definir o termo, use-o sem inventar definicao.
+   - Numeros por extenso so quando a norma os traz assim e a exatidao importa; nao repita "(dez mil reais)" a cada mencao.
+   - Nao opine, nao recomende e nao avalie o caso do usuario alem do que os trechos sustentam. Um registro mais legivel muda o TOM, nunca o conteudo.
+   - Nao use aberturas de conversa nem enfase vazia ("entendo sua duvida", "e importante destacar que", "vale ressaltar", "cumpre esclarecer"). Va direto.
+
+4. PENSE EM PROCESSO, NAO EM DISPOSITIVOS (selecao — SOMENTE no modo procedimental)
+   A pergunta e sobre uma tarefa administrativa que alguem precisa executar, nao sobre o que existe no documento. Os trechos recuperados sao um universo de CANDIDATOS, reunidos por proximidade de assunto — nao um roteiro a reproduzir. Recuperar um trecho significa apenas que ele esta disponivel; cabe a voce decidir se ele e necessario para responder.
+   Aplique este raciocinio quando a pergunta for sobre executar ou compreender uma atividade ou procedimento; perguntas pontuais (um prazo, um valor, uma definicao) respondem direto.
+   Antes de escrever, reconstrua mentalmente o processo perguntado: qual atividade o usuario quer executar, em que escopo e cadencia, e quais sao as suas etapas naturais (o que precisa ser providenciado, executado e verificado, e o que antecede a conclusao). Use como etapas APENAS o que os trechos descrevem — nunca invente fases ou passos. O processo e uma LENTE para selecionar e ordenar; nunca uma fonte de fatos.
+   Para cada dispositivo recuperado, decida nesta ordem:
+   a) Responde diretamente ao que foi perguntado? -> inclua.
+   b) Senao: e uma etapa indispensavel para executar exatamente o processo perguntado, ainda que trate de obrigacao de outra parte (contratada, gestor, fiscal tecnico...) ou de um documento/insumo sem o qual a atividade nao ocorre? -> inclua.
+   c) Senao — apenas complementa o assunto, detalha outra modalidade da atividade (ex.: por amostragem), trata de outra fase, de excecoes, de diretrizes gerais ou de procedimentos acessorios? -> NAO entra automaticamente. So aparece se a pergunta pedir explicitamente esse aprofundamento, ou se a sua ausencia tornar impossivel compreender ou executar o processo.
+   Omita em silencio o que ficar de fora: nao os cite, nao avise que existem, nao justifique exclusoes.
+
+5A. ESTRUTURA DA RESPOSTA PONTUAL (tipos DECISAO, QUANTIDADE e IDENTIDADE)
+   O ESQUELETO VEM DA PERGUNTA (secao 1). Antes de escrever, separe a pergunta nas duvidas que ela contem e trate-as na ordem em que foram feitas. Depois monte:
+
+   1) ABERTURA — as primeiras linhas, sem nenhum titulo antes delas. A PRIMEIRA PALAVRA ja pertence ao tipo de resposta pedido:
+      - DECISAO: abra pela propria decisao — "Sim.", "Nao.", "Sim, desde que ...", "Nao, salvo ...". A condicao que qualifica a decisao vem na mesma frase ou na seguinte, nunca antes dela.
+      - QUANTIDADE: abra pelo numero com a sua unidade — "O prazo maximo e de 60 (sessenta) meses.", "O limite e de R$ 10.000,00.".
+      - IDENTIDADE: abra pela designacao exata, reproduzida como consta no trecho, sem abreviar nem corrigir — "A empresa contratada e a RELUZIR SERVICOS TERCEIRIZADOS LTDA.".
+      Regra comum a todos: NADA precede a resposta — nem contextualizacao, nem mencao ao documento, nem reformulacao da pergunta. Quem ler apenas a abertura ja sabe o que fazer.
+      Pergunta composta: responda os tipos presentes na ordem em que foram perguntados, ainda na abertura, em uma ou duas frases.
+   2) DESENVOLVIMENTO — logo abaixo, o minimo necessario para a resposta ser APLICAVEL ao caso concreto:
+      - a regra geral de que a resposta e excecao (ou vice-versa);
+      - a condicao, o limite ou a hipotese que delimita a resposta;
+      - a SAIDA para o caso que fica FORA da resposta, sempre que os trechos a indicarem: o que passa a ser exigido quando o limite e ultrapassado, a condicao nao se cumpre ou a hipotese nao se aplica. Isso faz parte da resposta — sem essa saida o servidor fica sabendo o que NAO pode, mas nao o que fazer no lugar.
+      Escreva em paragrafos curtos; use lista com "- " quando a norma trouxer alternativas ou hipoteses paralelas, nunca para transformar a explicacao num resumo da norma.
+      NAO enumere requisitos, condicoes de instrucao processual, etapas ou subitens de um procedimento que a pergunta nao pediu. Isso vale MESMO que eles estejam marcados como DISPOSITIVOS CENTRAIS e MESMO que sejam subitens do proprio dispositivo que responde — a marcacao de centralidade e um sinal interno de recuperacao, nunca uma ordem de cobertura. Se a existencia deles for util para quem perguntou, diga que existem em UMA frase, indicando onde estao (ex.: "a prorrogacao ainda depende do cumprimento dos requisitos de instrucao previstos no proprio Item 3.1"), sem lista-los um a um.
+   3) SECOES OPCIONAIS — o desenvolvimento so vira secoes com "## " quando tiver TRES ou mais pontos distintos, ou passar de dois paragrafos. Abaixo disso, texto corrido le melhor: uma resposta curta com titulos vira um relatorio sobre duas frases.
+      O titulo diz, em uma ou duas palavras do vocabulario do leitor, O QUE ELE ENCONTRA ali: "## Limite", "## Excecao", "## Consequencia", "## O que fazer acima do limite", "## Quando nao se aplica". NUNCA nomeie o dispositivo, a sua finalidade normativa ou a sua numeracao ("## Do instrumento de contrato", "## Art. 95", "## Regras de formalizacao").
+      A proibicao de "categorias inventadas" da secao 5B NAO vale aqui: ela e exclusiva do modo procedimental, onde a unidade de organizacao e o dispositivo. Na resposta pontual a unidade de organizacao e a DUVIDA.
+      A abertura (parte 1) nunca fica sob um titulo — ela vem antes de qualquer "## ".
+   4) FUNDAMENTACAO — sempre a ultima parte, com o titulo "## Fundamentacao" e, abaixo dele, uma linha por dispositivo, cada uma inteira em negrito, montada com os dados da anotacao de origem: "**<artigo ou item> – <anexo, se houver> – <nome do documento>**" (ex.: "**Art. 95 – Lei no 14.133/2021**", "**Item 10.2 – Anexo VIII-B – IN 05/2017**"). Escreva os valores reais, nunca as palavras-modelo "Anexo Y" ou "Documento Z", e nao prefixe o nome do documento com "Documento".
+      Cite APENAS os dispositivos de onde saiu algum fato efetivamente afirmado na resposta. Um dispositivo que voce leu mas nao usou nao entra na fundamentacao — em especial os subitens que voce corretamente deixou de enumerar.
+   NAO se aplicam a resposta pontual: a selecao por processo (secao 4), o bloco por dispositivo com titulo e lista (secao 5B) e a cobertura integral de subitens com contagem de blocos (secao 6). Continuam valendo integralmente a LINGUAGEM E REGISTRO (secao 3), a FIDELIDADE (secao 7) e as regras de Markdown de titulo, lista e espacamento (secao 5B).
+
+5B. ESTRUTURA E FORMATO (modo procedimental)
+   Depois de selecionar os dispositivos, NAO reorganize o conteudo livremente: a resposta segue obrigatoriamente esta estrutura.
+   - So geram bloco os DISPOSITIVOS CENTRAIS que voce selecionar (regra PENSE EM PROCESSO). O que estiver sob "MATERIAL DE APOIO", e o que for correlato, de outra modalidade, diretriz geral ou excecao, NUNCA gera bloco proprio — serve so para referencia cruzada ou quando sua ausencia tornar a resposta impossivel. Estar no contexto nao obriga a virar bloco.
+   - Introducao: um unico paragrafo curto resumindo o contexto. Ex: "As rotinas da fiscalizacao mensal previstas no Anexo VIII-B da IN 05/2017 compreendem as seguintes obrigacoes e verificacoes."
+   - Depois, um bloco para CADA dispositivo selecionado — exatamente um dispositivo por bloco, neste formato EXATO (inclusive as linhas em branco):
+
+       ## <Nome da atividade / finalidade do dispositivo>
+
+       **Item X – Anexo Y – Documento Z**
+
+       <uma ou duas frases curtas e naturais introduzindo o bloco; aqui SIM cabem tempo e condicao, ex.: "Ao final de cada periodo mensal, o fiscal administrativo devera:">
+
+       - <acao 1>;
+       - <acao 2>;
+       - <acao 3>.
+
+   - REGRAS DE MARKDOWN (obrigatorias — a resposta e renderizada como Markdown):
+     * o titulo do bloco usa exatamente dois sustenidos seguidos de espaco ("## "); nunca use outro nivel de titulo, negrito ou texto solto no lugar dele;
+     * a linha imediatamente abaixo do titulo traz SOMENTE a referencia da fonte, inteira em negrito, no formato "**Item X – Anexo Y – Documento Z**" (ex.: "**Item 10.2 – Anexo VIII-B – IN 05/2017**"); inclua apenas os niveis que existirem na anotacao de origem do trecho — sem anexo, escreva "**Item X – Documento Z**";
+     * cada obrigacao, acao ou verificacao e um item de lista iniciado por hifen e espaco ("- "); NUNCA use "•", "*", "→", numeros ou qualquer outro marcador;
+     * UM item por linha — nunca dois itens na mesma linha, nunca uma lista escrita em texto corrido dentro de um paragrafo;
+     * subitens (alineas, incisos, desdobramentos de uma acao) entram como lista aninhada, indentada com dois espacos antes do hifen;
+     * deixe UMA linha em branco entre: o paragrafo de introducao e o primeiro bloco; o titulo e a linha de referencia; a linha de referencia e o paragrafo introdutorio; o paragrafo introdutorio e a lista; o fim de um bloco e o titulo do bloco seguinte;
+     * priorize a legibilidade: a resposta deve parecer um documento tecnico bem diagramado, nunca um bloco unico de texto.
+   - O TITULO nomeia a FINALIDADE do proprio dispositivo (ex.: "Verificacao de Dispendios e Emissao de Relatorio", "Documentacao Mensal da Contratada", "Diretrizes da Fiscalizacao Mensal"). O titulo NAO leva a referencia — ela vive exclusivamente na linha em negrito logo abaixo.
+   - PROIBIDO transformar dispositivos em fases do processo ou em categorias inventadas por voce. Nunca use como titulo "Antes do pagamento", "Para recebimento provisorio", "Durante a execucao", "Mensalmente", "Obrigacoes fiscais", "Outras verificacoes", "Fiscalizacao administrativa" e afins — sao interpretacoes suas. Tempo e condicao pertencem ao TEXTO do dispositivo (a frase introdutoria), nunca ao titulo. O titulo representa apenas o dispositivo selecionado.
+   - UM DISPOSITIVO = UM BLOCO (regra inviolavel). A unidade de organizacao da resposta e o DISPOSITIVO, nunca o tema. Cada dispositivo selecionado gera exatamente um bloco independente, com titulo, linha de referencia em negrito, frase introdutoria curta e lista de acoes (nunca tudo num unico paragrafo). E PROIBIDO: fundir dois dispositivos num mesmo bloco; incorporar um dispositivo como bullet ou complemento de outro; ocultar ou deduplicar um dispositivo porque trata do mesmo assunto; substituir um dispositivo por um resumo de outro. Se 9, 2.1 e 10.2 foram selecionados, existem obrigatoriamente TRES blocos distintos — a afinidade tematica nunca autoriza fusao.
+   - Identidade do bloco: todo o conteudo de um bloco vem EXCLUSIVAMENTE do seu proprio dispositivo; nunca misture obrigacoes de dispositivos diferentes. Errado: descrever as certidoes que a contratada apresenta (Item 2.1) dentro do bloco do Item 10.2. Certo: o Item 2.1 tem o seu proprio bloco, titulado "## Documentacao mensal apresentada pela contratada" e referenciado por "**Item 2.1 – Anexo VIII-B – IN 05/2017**".
+   - Independencia: quando dois dispositivos tratam do mesmo assunto (ex.: certidoes), eles continuam sendo obrigacoes distintas e mantem blocos separados. So e permitida REFERENCIA CRUZADA, nunca fusao, deduplicacao, condensacao ou absorcao. Ex.: no bloco do Item 10.2 pode-se escrever "a documentacao correspondente e apresentada pela contratada conforme o Item 2.1" — mas o Item 2.1 mantem o seu proprio bloco.
+   - Metadados NAO viram um bloco separado: nao escreva linhas rotuladas "Documento:", "Anexo:", "Item:", "Descricao:" nem "Fonte:". A origem aparece somente na linha de referencia em negrito abaixo do titulo, no formato indicado. Prefira texto natural ("A contratada devera entregar os seguintes documentos:") a rotulos secos.
+   - Ordene os blocos pela sequencia LOGICA DO PROCESSO (a ordem em que o agente executa as etapas), e NAO pela ordem numerica dos itens nem pela ordem de recuperacao. Deduza a sequencia dos proprios dispositivos (marcos de tempo/condicao); onde a norma nao indicar ordem, nao invente.
+   - Sintetize cada acao de forma curta, sem copiar o texto integral da norma e sem omitir requisitos, prazos ou condicoes (ver COBERTURA). Um rotulo em negrito no inicio do bullet e opcional.
+   - Quando a resposta usar um unico dispositivo, gere UM unico bloco no mesmo padrao.
+
+6. COBERTURA COMPLETA DOS DISPOSITIVOS SELECIONADOS (SOMENTE no modo procedimental)
+   A completude e medida pelo que a PERGUNTA pede — nunca pelo volume do que foi recuperado. Numa resposta pontual (decisao, quantidade ou identidade), ela esta completa quando o que foi perguntado e as suas condicoes de validade foram ditos; enumerar o procedimento inteiro nao a torna mais completa, torna-a menos util. As regras abaixo valem no modo procedimental, em que o que foi pedido E o conjunto.
+   Ai sim a completude vale DENTRO de cada dispositivo que voce selecionou — nunca sobre todo o contexto recuperado. Selecionado um dispositivo, apresente-o por inteiro: todos os subitens, alineas, incisos, listas, obrigacoes, condicoes e excecoes que lhe pertencem. Sintetize a redacao de cada item se ajudar, mas nunca trunque, interrompa nem reduza a quantidade de itens de um dispositivo selecionado, nem omita requisitos, prazos ou condicoes; o fim da lista importa tanto quanto o inicio. Nao condense itens distintos em um so nem os substitua por uma descricao generica ("entre outras rotinas", "diversos procedimentos").
+   Antes de finalizar, faca quatro conferencias:
+   - Precisao: algum dispositivo entrou apenas por tratar do mesmo tema, sem ocupar uma etapa necessaria do processo? Remova-o.
+   - Recall: alguma etapa indispensavel do processo aparece no contexto recuperado mas ficou de fora? Inclua-a.
+   - Cobertura: cada dispositivo selecionado foi apresentado integralmente, sem subitem pertinente omitido?
+   - Contagem: conte APENAS os dispositivos que voce selecionou como centrais — material de apoio, correlatos, outra modalidade, diretrizes gerais e excecoes NAO contam e NAO viram bloco. O numero de blocos deve COINCIDIR com esse total de selecionados. Se um selecionado foi fundido ou absorvido em outro bloco, separe-o num bloco proprio; se um dispositivo NAO selecionado virou bloco, remova-o. Selecionar continua sendo tarefa da regra PENSE EM PROCESSO — estar no contexto nunca obriga a incluir.
+
+7. FIDELIDADE AO TEXTO NORMATIVO
+   Use somente o conteudo dos trechos fornecidos; nao use conhecimento externo.
+   O processo que voce reconstroi serve para selecionar e ordenar — nao e fonte de fatos. Etapas, sequencia e vinculos entre dispositivos so podem ser afirmados na medida em que os trechos os sustentam; nao invente ligacoes, causas ou passos que a norma nao declara.
+   Nao invente dispositivos, numeros ou continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
+   Se um dispositivo mencionado nos trechos remeter a um subitem, alinea ou inciso cujo texto NAO esta presente, registre a ausencia em uma nota curta entre parenteses (ex: "(a alinea 'b.1' e referida, mas seu texto nao consta dos trechos disponiveis)") — nunca invente o conteudo ausente nem descarte a referencia em silencio.
+   Nao faca interpretacao juridica, recomendacao ou opiniao alem do que a norma diz.
+   Se os trechos nao contiverem a informacao perguntada, responda EXATAMENTE:
+   "As informacoes disponiveis nao sao suficientes."
+
+   CONFERENCIA FINAL (todos os modos) — refaca a resposta se alguma falhar:
+   - A PRIMEIRA PALAVRA pertence ao tipo pedido (a decisao, o numero ou o nome)? Se a resposta comeca contextualizando, comecou pelo lugar errado.
+   - A pergunta continha MAIS DE UMA interrogacao ou pedido ("posso...? de onde...? o que acontece se...?")? Entao CADA uma delas precisa de resposta explicita e propria — releia a pergunta clausula a clausula e confira uma a uma. Deixar a ultima interrogacao sem resposta, por ja ter respondido as primeiras, e o erro mais comum.
+   - A ordem dos assuntos e a ordem da PERGUNTA, ou virou a ordem dos artigos?
+   - Sobrou "voce" dirigido ao leitor, ou alguma frase que narra a norma ("o dispositivo estabelece", "nos termos do artigo") em vez de dizer o que se pode ou se deve fazer?
+   - Os titulos "## " existentes ganham a leitura, ou transformaram tres frases num relatorio? Na duvida, remova-os.
+   - Toda afirmacao — cada numero, prazo, valor e condicao — sai de algum trecho fornecido? Uma redacao mais natural nunca autoriza afirmar o que os trechos nao dizem: em caso de duvida entre soar melhor e ser fiel, escolha SEMPRE ser fiel.
+
+8. CITACAO DA FONTE
+   A origem sai da anotacao interna do trecho, sem inventar dados que nao estejam la e incluindo apenas os niveis que existirem. Onde ela aparece depende do modo:
+   - resposta pontual (decisao, quantidade, identidade): agrupada ao final, sob "## Fundamentacao" (secao 5A). O corpo da resposta fica limpo — sem citacao inline e sem referencia no meio das frases.
+   - modo procedimental: UMA unica vez por bloco, na linha em negrito imediatamente abaixo do titulo do bloco, no formato "**Item X – Anexo Y – Documento Z**" (ex.: "**Item 10.2 – Anexo VIII-B – IN 05/2017**").
+   Em ambos os modos: nao repita a referencia no titulo, nao crie bloco de metadados nem "Fonte:" ao final, e nao interrompa o texto com citacoes inline. Nunca use rotulos internos do sistema (nunca escreva "Trecho N", "Fonte N", "PRINCIPAL" ou "COMPLEMENTAR"). Cite apenas dispositivos efetivamente usados e reproduza exatamente a numeracao que aparece nos trechos.
+
+--- TRECHOS DOS DOCUMENTOS (uso interno) ---
+${contextBlock}
+--- FIM DOS TRECHOS ---
+
+Pergunta: ${userQuery}
+
+Resposta:`;
 }
 let RagService = RagService_1 = class RagService {
     prisma;
@@ -84,16 +428,36 @@ let RagService = RagService_1 = class RagService {
     async onModuleInit() {
         const apiKey = process.env.GOOGLE_API_KEY;
         if (!apiKey) {
-            this.logger.error('Variavel GOOGLE_API_KEY nao encontrada no arquivo .env');
+            this.logger.error('Variavel GOOGLE_API_KEY nao encontrada no .env');
             return;
         }
         this.embeddings = new NativeGeminiEmbeddings(apiKey);
         this.llm = new google_genai_1.ChatGoogleGenerativeAI({
             apiKey,
-            model: 'gemini-2.5-flash',
-            temperature: 0.3,
+            model: 'gemini-3.6-flash',
+            temperature: 0.1,
+            maxOutputTokens: 8192,
+            thinkingConfig: { thinkingBudget: 2048 },
+            safetySettings: [
+                {
+                    category: generative_ai_2.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    category: generative_ai_2.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    category: generative_ai_2.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE,
+                },
+                {
+                    category: generative_ai_2.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold: generative_ai_2.HarmBlockThreshold.BLOCK_NONE,
+                },
+            ],
         });
-        const config = {
+        this.vectorStore = await pgvector_1.PGVectorStore.initialize(this.embeddings, {
             postgresConnectionOptions: {
                 type: 'postgres',
                 connectionString: process.env.DATABASE_URL,
@@ -105,68 +469,619 @@ let RagService = RagService_1 = class RagService {
                 contentColumnName: 'text',
                 metadataColumnName: 'metadata',
             },
-        };
-        this.vectorStore = await pgvector_1.PGVectorStore.initialize(this.embeddings, config);
-        this.logger.log('RAG Service inicializado com sucesso (Gemma 4 + pgvector)');
-    }
-    async indexDocument(content, documentId, title) {
-        const splitter = new textsplitters_1.RecursiveCharacterTextSplitter({
-            chunkSize: 1000,
-            chunkOverlap: 200,
         });
-        const chunks = await splitter.splitText(content);
-        const documents = chunks.map((chunk) => new documents_1.Document({ pageContent: chunk, metadata: { documentId, title } }));
-        await this.vectorStore.addDocuments(documents);
-        this.logger.log(`Indexado: "${title}" (${documents.length} chunks)`);
-        return { success: true, documentId };
+        this.logger.log('RAG Service inicializado (Gemini 2.5 + pgvector + PDR persistido)');
+    }
+    async indexDocument(rawContent, documentId, title, pages) {
+        const vocabulary = collectAttestedWords(stripInvisibleArtifacts(rawContent));
+        const cleanedText = cleanExtractedText(rawContent, vocabulary);
+        const chunks = (0, legal_document_splitter_1.splitLegalDocument)(cleanedText);
+        const docIndex = (0, document_location_1.buildNormalizedIndex)(cleanedText);
+        const pageMap = pages?.length
+            ? (0, document_location_1.buildPageMap)(docIndex, pages.map((page) => ({
+                page: page.page,
+                text: cleanExtractedText(page.text, vocabulary),
+            })))
+            : [];
+        const chunkRanges = (0, document_location_1.locateSequentialSegments)(docIndex, chunks.map((chunk) => chunk.content));
+        await this.prisma.normativeDocument.updateMany({
+            where: { id: documentId },
+            data: {
+                indexed_content: cleanedText,
+                page_map: pageMap.length
+                    ? pageMap
+                    : undefined,
+                total_pages: pages?.length
+                    ? Math.max(...pages.map((page) => page.page))
+                    : undefined,
+            },
+        });
+        let totalChildren = 0;
+        let locatedSections = 0;
+        const groupMap = new Map();
+        chunks.forEach((chunk, i) => {
+            const { n1_header, n2_header } = chunk.metadata;
+            const key = `${n1_header}|||${n2_header}`;
+            if (!groupMap.has(key)) {
+                groupMap.set(key, {
+                    n1_header,
+                    n2_header,
+                    sectionHeader: (n2_header || n1_header || source_citation_2.SECTION_HEADER_FALLBACK).slice(0, 255),
+                    contentParts: [],
+                    partRanges: [],
+                });
+            }
+            const group = groupMap.get(key);
+            group.contentParts.push(chunk.content);
+            group.partRanges.push(chunkRanges[i]);
+        });
+        const sectionHeadingByN1 = new Map();
+        for (const entry of groupMap.values()) {
+            if (entry.n2_header === '' &&
+                !sectionHeadingByN1.has(entry.n1_header)) {
+                const preamble = entry.contentParts
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 200);
+                if (preamble)
+                    sectionHeadingByN1.set(entry.n1_header, preamble);
+            }
+        }
+        const allChildDocs = [];
+        for (const entry of groupMap.values()) {
+            const fullContent = entry.contentParts.join('\n');
+            const locatedParts = (0, document_location_1.buildLocatedParts)(entry.contentParts, entry.partRanges);
+            const parentRange = (0, document_location_1.mergeRanges)(entry.partRanges);
+            if (parentRange)
+                locatedSections++;
+            const savedParent = await this.prisma.parentChunk.create({
+                data: {
+                    document_id: documentId,
+                    section_header: entry.sectionHeader,
+                    content: fullContent,
+                    metadata: {
+                        documentId,
+                        title,
+                        n1_header: entry.n1_header,
+                        n2_header: entry.n2_header,
+                        ...locationMetadata(parentRange, (0, document_location_1.resolvePageSpan)(pageMap, parentRange)),
+                    },
+                },
+            });
+            const childChunks = fullContent.length > legal_document_splitter_1.CHILD_CHUNK_SIZE
+                ? (0, legal_document_splitter_1.splitIntoChildChunksWithOffsets)(fullContent)
+                : [{ content: fullContent, start: 0, end: fullContent.length }];
+            for (const child of childChunks) {
+                const childRange = (0, document_location_1.locateInDocument)(docIndex, locatedParts, child.start, child.end);
+                allChildDocs.push(new documents_1.Document({
+                    pageContent: child.content,
+                    metadata: {
+                        documentId,
+                        title,
+                        parentId: savedParent.id,
+                        n1_header: entry.n1_header,
+                        n2_header: entry.n2_header,
+                        ...locationMetadata(childRange, (0, document_location_1.resolvePageSpan)(pageMap, childRange)),
+                    },
+                }));
+            }
+        }
+        const batches = chunkArray(allChildDocs, EMBEDDING_BATCH_SIZE);
+        for (let i = 0; i < batches.length; i++) {
+            const batch = batches[i];
+            this.logger.log(`[RAG] Vetorizando lote ${i + 1}/${batches.length} (${batch.length} chunks)...`);
+            let attempt = 0;
+            while (attempt < EMBEDDING_MAX_RETRIES) {
+                try {
+                    const embedTexts = batch.map((doc) => {
+                        const md = doc.metadata;
+                        const heading = sectionHeadingByN1.get(md.n1_header) ?? md.n1_header;
+                        return buildChunkEmbedText(doc.pageContent, {
+                            title: md.title,
+                            sectionHeading: heading,
+                            item: md.n2_header,
+                        });
+                    });
+                    const vectors = await this.embeddings.embedDocuments(embedTexts);
+                    await this.vectorStore.addVectors(vectors, batch);
+                    totalChildren += batch.length;
+                    break;
+                }
+                catch (err) {
+                    const is429 = err?.status === 429 ||
+                        String(err?.message).includes('429') ||
+                        String(err?.message).toLowerCase().includes('quota');
+                    if (is429 && attempt < EMBEDDING_MAX_RETRIES - 1) {
+                        this.logger.warn(`[RAG] Rate limit (429) no lote ${i + 1}. Aguardando ${EMBEDDING_RETRY_DELAY / 1000}s...`);
+                        await delay(EMBEDDING_RETRY_DELAY);
+                        attempt++;
+                    }
+                    else {
+                        throw err;
+                    }
+                }
+            }
+            if (i < batches.length - 1)
+                await delay(EMBEDDING_BATCH_DELAY);
+        }
+        this.logger.log(`Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados, ` +
+            `${locatedSections}/${groupMap.size} secoes localizadas, ${pageMap.length} faixa(s) de pagina`);
+        return {
+            success: true,
+            documentId,
+            sections: groupMap.size,
+            childChunks: totalChildren,
+            pagesMapped: pageMap.length,
+            locatedSections,
+        };
+    }
+    async backfillDocumentLocations(documentId) {
+        const document = await this.prisma.normativeDocument.findUnique({
+            where: { id: documentId },
+            select: { id: true, original_content: true },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Documento nao encontrado');
+        }
+        const cleanedText = cleanExtractedText(document.original_content);
+        const docIndex = (0, document_location_1.buildNormalizedIndex)(cleanedText);
+        const parents = await this.prisma.parentChunk.findMany({
+            where: { document_id: documentId },
+            orderBy: { created_at: 'asc' },
+        });
+        const ranges = (0, document_location_1.locateSequentialSegments)(docIndex, parents.map((parent) => parent.content));
+        let located = 0;
+        for (let i = 0; i < parents.length; i++) {
+            const range = ranges[i];
+            if (!range)
+                continue;
+            located++;
+            await this.prisma.parentChunk.update({
+                where: { id: parents[i].id },
+                data: {
+                    metadata: {
+                        ...(parents[i].metadata ?? {}),
+                        ...locationMetadata(range, null),
+                    },
+                },
+            });
+        }
+        await this.prisma.normativeDocument.update({
+            where: { id: documentId },
+            data: { indexed_content: cleanedText },
+        });
+        this.logger.log(`[RAG] Backfill de localizacao em ${documentId}: ${located}/${parents.length} parents localizados`);
+        return { documentId, parents: parents.length, located };
+    }
+    async retrieveParentContexts(userQuery, k = RETRIEVAL_FETCH_K) {
+        const queryVec = await this.embeddings.embedQuery(userQuery);
+        trace('\n[TRACE 1] userQuery:', userQuery);
+        trace(`[TRACE 1] embedding: dim=${queryVec.length} | primeiros valores=[${queryVec
+            .slice(0, 5)
+            .map((v) => v.toFixed(6))
+            .join(', ')}]`);
+        let filter = undefined;
+        const anexoMatch = userQuery.match(/(?:Anexo)\s+([IVXLCDM]+(?:-[A-Z])?)/i);
+        if (anexoMatch) {
+            filter = { n1_header: anexoMatch[0].toUpperCase() };
+        }
+        trace('[TRACE 2] filter enviado para similaritySearchVectorWithScore:', JSON.stringify(filter ?? null));
+        let childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k, filter);
+        if (filter && childResults.length === 0) {
+            trace('[TRACE 2b] Busca filtrada sem resultados — refazendo sem filtro');
+            childResults = await this.vectorStore.similaritySearchVectorWithScore(queryVec, k);
+        }
+        if (DEBUG_RAG) {
+            trace(`\n[TRACE 3] ${childResults.length} child chunk(s) retornados:`);
+            childResults.forEach(([child, score], i) => {
+                trace(`  [${i + 1}] score=${score.toFixed(6)}` +
+                    ` | n1="${child.metadata.n1_header ?? ''}"` +
+                    ` | n2="${child.metadata.n2_header ?? ''}"` +
+                    ` | parentId=${child.metadata.parentId}` +
+                    ` | preview="${child.pageContent.slice(0, 120).replace(/\n/g, ' ')}"`);
+            });
+        }
+        const parentIds = new Set();
+        const orderedParentIds = [];
+        const scoreByParentId = new Map();
+        for (const [child, score] of childResults) {
+            const parentId = child.metadata.parentId;
+            if (parentId && !parentIds.has(parentId)) {
+                parentIds.add(parentId);
+                orderedParentIds.push(parentId);
+            }
+            if (parentId) {
+                const prev = scoreByParentId.get(parentId);
+                if (prev === undefined || score < prev)
+                    scoreByParentId.set(parentId, score);
+            }
+        }
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 4] Ordem de insercao dos parentIds no Set:');
+            orderedParentIds.forEach((pid, i) => trace(`  ${i + 1} -> ${pid}`));
+        }
+        const parentRows = await this.prisma.parentChunk.findMany({
+            where: { id: { in: orderedParentIds } },
+        });
+        const parentMap = new Map(parentRows.map((row) => [row.id, row]));
+        let orderedParentRows = orderedParentIds
+            .map((id) => parentMap.get(id))
+            .filter((row) => row && row.content.length >= MIN_PARENT_CONTENT_LENGTH);
+        const siblingExpansionGroups = new Map();
+        for (const row of orderedParentRows) {
+            const n2Header = (0, hierarchical_context_1.getN2Header)(row);
+            const prefixInfo = (0, hierarchical_context_1.deriveSiblingPrefix)(n2Header);
+            if (!prefixInfo)
+                continue;
+            const parsedN2 = (0, legal_document_splitter_1.parseItemNumber)(n2Header);
+            const lastNumber = parsedN2.numbers[parsedN2.numbers.length - 1];
+            const groupKey = `${row.document_id}|||${(0, hierarchical_context_1.getN1Header)(row)}|||${prefixInfo.parentPrefix}|||${prefixInfo.level}`;
+            const score = scoreByParentId.get(row.id) ?? Infinity;
+            const existingGroup = siblingExpansionGroups.get(groupKey);
+            if (!existingGroup) {
+                siblingExpansionGroups.set(groupKey, {
+                    documentId: row.document_id,
+                    n1Header: (0, hierarchical_context_1.getN1Header)(row),
+                    parentPrefix: prefixInfo.parentPrefix,
+                    parentNumbers: prefixInfo.parentNumbers,
+                    level: prefixInfo.level,
+                    bestScore: score,
+                    retrievedIds: new Set([row.id]),
+                    retrievedLastNumbers: [lastNumber],
+                });
+            }
+            else {
+                existingGroup.retrievedIds.add(row.id);
+                existingGroup.bestScore = Math.min(existingGroup.bestScore, score);
+                existingGroup.retrievedLastNumbers.push(lastNumber);
+            }
+        }
+        const siblingParents = [];
+        if (siblingExpansionGroups.size > 0) {
+            for (const group of siblingExpansionGroups.values()) {
+                const candidates = await this.prisma.parentChunk.findMany({
+                    where: {
+                        document_id: group.documentId,
+                        metadata: { path: ['n1_header'], equals: group.n1Header },
+                        section_header: { startsWith: group.parentPrefix },
+                    },
+                });
+                const validCandidates = [];
+                for (const candidate of candidates) {
+                    if (group.retrievedIds.has(candidate.id))
+                        continue;
+                    if (candidate.content.length < MIN_PARENT_CONTENT_LENGTH)
+                        continue;
+                    const candidateHeader = (0, hierarchical_context_1.getN2Header)(candidate);
+                    const parsedCandidate = (0, legal_document_splitter_1.parseItemNumber)(candidateHeader);
+                    if (!parsedCandidate || parsedCandidate.level !== group.level)
+                        continue;
+                    if (!group.parentNumbers.every((value, idx) => parsedCandidate.numbers[idx] === value))
+                        continue;
+                    const candidateLast = parsedCandidate.numbers[parsedCandidate.numbers.length - 1];
+                    const distance = Math.min(...group.retrievedLastNumbers.map((n) => Math.abs(candidateLast - n)));
+                    validCandidates.push({ row: candidate, distance });
+                }
+                validCandidates.sort((a, b) => a.distance - b.distance);
+                for (const { row } of validCandidates.slice(0, MAX_SIBLINGS_PER_GROUP)) {
+                    siblingParents.push(row);
+                    scoreByParentId.set(row.id, group.bestScore);
+                }
+            }
+        }
+        const descendantParents = [];
+        const siblingDescendantParents = [];
+        const alreadySelectedIds = new Set([
+            ...orderedParentRows.map((row) => row.id),
+            ...siblingParents.map((row) => row.id),
+        ]);
+        const expansionSources = [
+            ...orderedParentRows.map((row) => ({ row, viaSibling: false })),
+            ...siblingParents.map((row) => ({ row, viaSibling: true })),
+        ];
+        for (const { row, viaSibling } of expansionSources) {
+            const parsedSelf = (0, legal_document_splitter_1.parseItemNumber)((0, hierarchical_context_1.getN2Header)(row));
+            if (!parsedSelf)
+                continue;
+            const childPrefix = `${parsedSelf.numbers.join('.')}.`;
+            const childLevel = parsedSelf.level + 1;
+            const children = await this.prisma.parentChunk.findMany({
+                where: {
+                    document_id: row.document_id,
+                    metadata: { path: ['n1_header'], equals: (0, hierarchical_context_1.getN1Header)(row) },
+                    section_header: { startsWith: childPrefix },
+                },
+            });
+            const directChildren = [];
+            for (const child of children) {
+                if (alreadySelectedIds.has(child.id))
+                    continue;
+                if (child.content.length < MIN_PARENT_CONTENT_LENGTH)
+                    continue;
+                const parsedChild = (0, legal_document_splitter_1.parseItemNumber)((0, hierarchical_context_1.getN2Header)(child));
+                if (!parsedChild || parsedChild.level !== childLevel)
+                    continue;
+                if (!parsedSelf.numbers.every((value, idx) => parsedChild.numbers[idx] === value))
+                    continue;
+                directChildren.push(child);
+            }
+            const inheritedScore = scoreByParentId.get(row.id) ?? Infinity;
+            for (const child of (0, hierarchical_context_1.sortParentsByStructuralOrder)(directChildren).slice(0, MAX_DESCENDANTS_PER_ITEM)) {
+                (viaSibling ? siblingDescendantParents : descendantParents).push(child);
+                alreadySelectedIds.add(child.id);
+                scoreByParentId.set(child.id, inheritedScore);
+            }
+        }
+        if (siblingParents.length > 0 ||
+            descendantParents.length > 0 ||
+            siblingDescendantParents.length > 0) {
+            const parentsByGroup = new Map();
+            const groupOrder = [];
+            const appendParent = (parent) => {
+                const key = `${parent.document_id}|||${(0, hierarchical_context_1.getN1Header)(parent)}`;
+                if (!parentsByGroup.has(key)) {
+                    parentsByGroup.set(key, []);
+                    groupOrder.push(key);
+                }
+                const groupRows = parentsByGroup.get(key);
+                if (!groupRows.some((row) => row.id === parent.id)) {
+                    groupRows.push(parent);
+                }
+            };
+            orderedParentRows.forEach(appendParent);
+            siblingParents.forEach(appendParent);
+            descendantParents.forEach(appendParent);
+            siblingDescendantParents.forEach(appendParent);
+            orderedParentRows = groupOrder.flatMap((key) => (0, hierarchical_context_1.sortParentsByStructuralOrder)(parentsByGroup.get(key)));
+        }
+        const retrievedScopeHits = new Map();
+        for (const [child] of childResults) {
+            const pid = child.metadata.parentId;
+            const row = pid ? parentMap.get(pid) : undefined;
+            if (!row || row.content.length < MIN_PARENT_CONTENT_LENGTH)
+                continue;
+            const scopeKey = `${row.document_id}|||${(0, hierarchical_context_1.getN1Header)(row)}`;
+            retrievedScopeHits.set(scopeKey, (retrievedScopeHits.get(scopeKey) ?? 0) + 1);
+        }
+        let topScope;
+        let topScoreSeen = Infinity;
+        for (const id of orderedParentIds) {
+            const row = parentMap.get(id);
+            if (!row || row.content.length < MIN_PARENT_CONTENT_LENGTH)
+                continue;
+            const score = scoreByParentId.get(id) ?? Infinity;
+            if (score < topScoreSeen) {
+                topScoreSeen = score;
+                topScope = `${row.document_id}|||${(0, hierarchical_context_1.getN1Header)(row)}`;
+            }
+        }
+        const beforePrune = orderedParentRows.length;
+        orderedParentRows = (0, hierarchical_context_1.pruneForeignAnexoContamination)(orderedParentRows, retrievedScopeHits, topScope);
+        if (DEBUG_RAG && orderedParentRows.length !== beforePrune) {
+            trace(`[COERENCIA] Removidos ${beforePrune - orderedParentRows.length} parent(s) de anexo estranho ao processo dominante`);
+        }
+        const provenanceById = new Map();
+        const addProvenance = (id, p) => {
+            const set = provenanceById.get(id) ?? new Set();
+            set.add(p);
+            provenanceById.set(id, set);
+        };
+        for (const id of orderedParentIds)
+            addProvenance(id, 'HIT');
+        for (const row of descendantParents)
+            addProvenance(row.id, 'DESCENDANT');
+        for (const row of siblingParents)
+            addProvenance(row.id, 'SIBLING');
+        for (const row of siblingDescendantParents)
+            addProvenance(row.id, 'SIBLING');
+        const selectionPriority = (row) => {
+            const prov = provenanceById.get(row.id);
+            if (!prov || prov.has('HIT'))
+                return 0;
+            if (prov.has('DESCENDANT'))
+                return 1;
+            return 2;
+        };
+        const clusters = (0, hierarchical_context_1.buildClusters)(orderedParentRows, scoreByParentId);
+        const boostedClusters = (0, hierarchical_context_1.applyHierarchicalBoost)(clusters);
+        const boostedParents = (0, hierarchical_context_1.flattenClusters)(boostedClusters, selectionPriority);
+        const parentsToUse = boostedParents.length
+            ? boostedParents
+            : orderedParentRows;
+        const ranked = (0, hierarchical_context_1.rankByProvenance)(parentsToUse, provenanceById, scoreByParentId);
+        const orderedForPrompt = ranked.map((r) => r.row);
+        const roleById = new Map(ranked.map((r) => [r.row.id, r.role]));
+        if (DEBUG_RAG) {
+            trace('\n[PROVENIENCIA] classificacao por origem no conjunto candidato:');
+            ranked.forEach((r) => trace(`  ${r.role.padEnd(11)} | origem=[${r.provenance.join(',') || 'desconhecida'}]` +
+                ` | section="${r.row.section_header}" | parentId=${r.row.id}`));
+        }
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 5] Ordem retornada pelo Prisma (parentChunk.findMany):');
+            parentRows.forEach((row, i) => trace(`  [${i + 1}] id=${row.id} | section="${row.section_header}" | chars=${row.content.length}`));
+            const prismaPreservedOrder = orderedParentIds.every((pid, i) => parentRows[i]?.id === pid);
+            trace(`[TRACE 5] O Prisma preservou a ordem dos parentIds? ${prismaPreservedOrder ? 'SIM' : 'NAO'}`);
+            trace('  (esperado):', orderedParentIds.join(' -> '));
+            trace('  (recebido):', parentRows.map((r) => r.id).join(' -> '));
+        }
+        const triggeringChildrenByParentId = new Map();
+        for (const [child] of childResults) {
+            const pid = child.metadata.parentId;
+            if (!pid)
+                continue;
+            const list = triggeringChildrenByParentId.get(pid) ?? [];
+            list.push(child);
+            triggeringChildrenByParentId.set(pid, list);
+        }
+        const parents = orderedForPrompt.map((row) => {
+            const triggeringChildren = triggeringChildrenByParentId.get(row.id) ?? [];
+            let pageContent = row.content;
+            if (triggeringChildren.length > 0 &&
+                row.content.length > SLIDING_WINDOW_MIN_PARENT_LENGTH) {
+                let firstAnchor = Infinity;
+                let lastAnchorEnd = -Infinity;
+                for (const child of triggeringChildren) {
+                    const idx = findAnchorIndex(row.content, child.pageContent);
+                    if (idx === -1)
+                        continue;
+                    firstAnchor = Math.min(firstAnchor, idx);
+                    lastAnchorEnd = Math.max(idx + child.pageContent.length, lastAnchorEnd);
+                }
+                const startIndex = Number.isFinite(firstAnchor) ? firstAnchor : -1;
+                if (startIndex !== -1) {
+                    let windowStart = Math.max(0, startIndex - SLIDING_WINDOW_BEFORE);
+                    let windowEnd = Math.min(row.content.length, lastAnchorEnd + SLIDING_WINDOW_AFTER);
+                    windowStart = snapWindowStart(row.content, windowStart);
+                    windowEnd = snapWindowEnd(row.content, windowEnd);
+                    const slice = row.content.substring(windowStart, windowEnd);
+                    const prefix = windowStart > 0 ? '[...] ' : '';
+                    const suffix = windowEnd < row.content.length ? ' [...]' : '';
+                    pageContent = `${prefix}${slice}${suffix}`;
+                }
+            }
+            const parentRange = (0, document_location_1.readCharRange)(row.metadata);
+            const parentPages = (0, document_location_1.readPageSpan)(row.metadata);
+            const excerptRange = (0, document_location_1.mergeRanges)(triggeringChildren.map((child) => (0, document_location_1.readCharRange)(child.metadata)));
+            const excerptPages = (0, document_location_1.mergePageSpans)(triggeringChildren.map((child) => (0, document_location_1.readPageSpan)(child.metadata)));
+            return new documents_1.Document({
+                pageContent,
+                metadata: {
+                    documentId: row.document_id,
+                    title: row.metadata?.title ?? '',
+                    n1_header: row.metadata?.n1_header ?? '',
+                    n2_header: row.metadata?.n2_header ?? '',
+                    sectionHeader: row.section_header,
+                    parentId: row.id,
+                    role: roleById.get(row.id) ?? 'PRINCIPAL',
+                    ...(parentRange
+                        ? { charStart: parentRange.start, charEnd: parentRange.end }
+                        : {}),
+                    ...(parentPages
+                        ? { pageStart: parentPages.page_start, pageEnd: parentPages.page_end }
+                        : {}),
+                    ...(excerptRange
+                        ? {
+                            excerptCharStart: excerptRange.start,
+                            excerptCharEnd: excerptRange.end,
+                        }
+                        : {}),
+                    ...(excerptPages
+                        ? {
+                            excerptPageStart: excerptPages.page_start,
+                            excerptPageEnd: excerptPages.page_end,
+                        }
+                        : {}),
+                },
+            });
+        });
+        if (DEBUG_RAG) {
+            trace('\n[TRACE 6] Ordem final dos ParentChunks enviados ao LLM:');
+            parents.forEach((doc, i) => trace(`  [Fonte ${i + 1}${doc.metadata.role ? ` — ${doc.metadata.role}` : ''}] parentId=${doc.metadata.parentId} | section="${doc.metadata.sectionHeader}" | chars=${doc.pageContent.length}`));
+        }
+        const sourceDocIds = Array.from(new Set(parents
+            .map((doc) => doc.metadata.documentId)
+            .filter((id) => Boolean(id))));
+        return { parents, sourceDocIds };
+    }
+    async loadSourceDocuments(documentIds) {
+        if (documentIds.length === 0)
+            return new Map();
+        const rows = await this.prisma.normativeDocument.findMany({
+            where: { id: { in: documentIds } },
+            select: {
+                id: true,
+                title: true,
+                document_type: true,
+                total_pages: true,
+                file_name: true,
+                file_mime_type: true,
+                file_size: true,
+            },
+        });
+        return new Map(rows.map((row) => [row.id, row]));
     }
     async query(userQuery, conversationId) {
-        const queryVec = await this.embeddings.embedQuery(userQuery);
-        const contextDocs = await this.vectorStore.similaritySearchVectorWithScore(queryVec, 5);
-        const contextText = contextDocs.map(([doc]) => doc.pageContent).join('\n\n');
-        const prompt = `Você é um assistente do GeFi. Responda baseando-se APENAS no contexto abaixo.
-Se não souber, diga que não encontrou nos documentos.
-
-Contexto:
-${contextText}
-
-Pergunta: ${userQuery}`;
-        const response = await this.llm.invoke(prompt);
+        const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery);
+        const prompt = buildRagPrompt(parents, userQuery);
         let aiResponse = '';
-        if (typeof response.content === 'string') {
-            aiResponse = response.content;
-        }
-        else if (Array.isArray(response.content)) {
-            const textPart = response.content.find((part) => part.type === 'text');
-            aiResponse = textPart && 'text' in textPart
-                ? textPart.text
-                : JSON.stringify(response.content);
-        }
-        if (!aiResponse || aiResponse.trim() === '') {
-            aiResponse = 'Não encontrei informações nos documentos normativos para responder a esta pergunta.';
-        }
-        const sourcesMap = new Map();
-        contextDocs.forEach(([doc]) => {
-            const id = doc.metadata.documentId;
-            if (id && !sourcesMap.has(id)) {
-                sourcesMap.set(id, { id, title: doc.metadata.title });
+        let llmFailed = false;
+        let truncated = false;
+        try {
+            const response = await this.llm.invoke(prompt);
+            if (typeof response.content === 'string') {
+                aiResponse = response.content;
             }
-        });
-        const sources = Array.from(sourcesMap.values());
-        const uniqueDocIds = Array.from(sourcesMap.keys());
-        const savedInteraction = await this.prisma.interactionHistory.create({
+            else if (Array.isArray(response.content) &&
+                response.content.length > 0) {
+                const textPart = response.content.find((p) => p.type === 'text');
+                aiResponse =
+                    textPart && 'text' in textPart ? textPart.text : '';
+            }
+            const finishReason = resolveFinishReason(response);
+            if (finishReason === 'MAX_TOKENS') {
+                truncated = true;
+                this.logger.error('[LLM] Resposta truncada por limite de tokens (MAX_TOKENS) — saida possivelmente incompleta.');
+            }
+            else if (finishReason && finishReason !== 'STOP') {
+                this.logger.warn(`[LLM] finishReason inesperado: ${finishReason}`);
+            }
+        }
+        catch (err) {
+            llmFailed = true;
+            this.logger.error(`[LLM] Falha em llm.invoke — status=${err?.status ?? err?.code ?? 'n/a'} | message=${err?.message ?? String(err)}`);
+        }
+        if (llmFailed) {
+            aiResponse =
+                'Nao foi possivel gerar a resposta neste momento devido a uma falha tecnica na comunicacao com o modelo. Tente novamente em alguns instantes.';
+        }
+        else if (!aiResponse.trim()) {
+            aiResponse =
+                'As informacoes disponiveis nos documentos indexados nao sao suficientes para responder a esta pergunta com precisao.';
+        }
+        else if (truncated) {
+            aiResponse +=
+                '\n\n(Observacao do sistema: esta resposta pode ter sido interrompida por limite de tamanho e talvez nao cubra todos os itens. Refaca a pergunta de forma mais especifica para obter o restante.)';
+        }
+        const sources = (0, response_sources_1.buildResponseSources)(parents.map((doc) => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata,
+        })), await this.loadSourceDocuments(sourceDocIds));
+        const saved = await this.prisma.interactionHistory.create({
             data: {
                 conversation_id: conversationId,
                 user_query: userQuery,
                 ai_response: aiResponse,
                 responseSources: {
-                    create: uniqueDocIds.map((id) => ({
-                        normative: { connect: { id } },
+                    create: sources.map((source) => ({
+                        normative: { connect: { id: source.id } },
+                        excerpts: {
+                            create: source.excerpts.map((excerpt, rank) => ({
+                                parent_chunk_id: excerpt.parent_chunk_id,
+                                section_header: excerpt.section_header,
+                                n1_header: excerpt.n1_header,
+                                n2_header: excerpt.n2_header,
+                                citation: excerpt.citation,
+                                excerpt: excerpt.excerpt,
+                                role: excerpt.role,
+                                rank,
+                                page_start: excerpt.location?.page_start ?? null,
+                                page_end: excerpt.location?.page_end ?? null,
+                                char_start: excerpt.location?.char_start ?? null,
+                                char_end: excerpt.location?.char_end ?? null,
+                                location_precision: excerpt.location?.precision ?? null,
+                            })),
+                        },
                     })),
                 },
             },
         });
-        return { id: savedInteraction.id, created_at: savedInteraction.created_at, response: aiResponse, sources };
+        return {
+            id: saved.id,
+            created_at: saved.created_at,
+            response: aiResponse,
+            sources,
+        };
     }
 };
 exports.RagService = RagService;

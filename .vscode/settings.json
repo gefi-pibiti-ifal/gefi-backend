@@ -1,0 +1,23 @@
+{
+    "sqltools.connections": [
+        {
+            "server": "localhost",
+            "port": 9042,
+            "previewLimit": 50,
+            "askForPassword": true,
+            "driver": "Cassandra",
+            "name": "root"
+        },
+        {
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 5432,
+            "askForPassword": true,
+            "driver": "PostgreSQL",
+            "name": "GEFI",
+            "database": "gefi",
+            "username": "postgres"
+        }
+    ]
+}

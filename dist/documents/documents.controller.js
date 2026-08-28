@@ -16,6 +16,7 @@ exports.DocumentsController = void 0;
 const common_1 = require("@nestjs/common");
 const platform_express_1 = require("@nestjs/platform-express");
 const swagger_1 = require("@nestjs/swagger");
+const crypto_1 = require("crypto");
 const jwt_auth_guard_1 = require("../auth/jwt-auth.guard");
 const documents_service_1 = require("./documents.service");
 const rag_service_1 = require("../rag/rag.service");
@@ -35,11 +36,22 @@ let DocumentsController = class DocumentsController {
             throw new common_1.BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
         }
         let content;
+        let pages = [];
         try {
             const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
-            const loader = new pdf_1.PDFLoader(blob, { splitPages: false });
+            const loader = new pdf_1.PDFLoader(blob, { splitPages: true });
             const docs = await loader.load();
-            content = docs.map((doc) => doc.pageContent).join('\n').trim();
+            const textByPage = new Map();
+            docs.forEach((doc, index) => {
+                const pageNumber = doc.metadata?.loc?.pageNumber ?? index + 1;
+                textByPage.set(pageNumber, doc.pageContent);
+            });
+            const totalPages = docs[0]?.metadata?.pdf?.totalPages ?? docs.length;
+            pages = Array.from({ length: totalPages }, (_, i) => ({
+                page: i + 1,
+                text: textByPage.get(i + 1) ?? '',
+            }));
+            content = docs.map((doc) => doc.pageContent).join('\n\n').trim();
             if (!content) {
                 throw new common_1.BadRequestException('Não foi possível extrair texto. O PDF pode ser baseado em imagens (digitalizado).');
             }
@@ -55,9 +67,15 @@ let DocumentsController = class DocumentsController {
             document_type: body.document_type,
             original_content: content,
             admin_id: req.user.id,
+            file_name: file.originalname,
+            file_mime_type: file.mimetype,
+            file_size: file.size,
+            file_hash: (0, crypto_1.createHash)('sha256').update(file.buffer).digest('hex'),
+            file_data: file.buffer,
+            total_pages: pages.length || null,
         });
         this.ragService
-            .indexDocument(content, document.id, document.title)
+            .indexDocument(content, document.id, document.title, pages)
             .catch((err) => {
             const msg = err instanceof Error ? err.message : String(err);
             console.error(`[RAG] Falha ao indexar o documento ${document.id}: ${msg}`);
@@ -68,6 +86,28 @@ let DocumentsController = class DocumentsController {
         const pageNum = page ? parseInt(page, 10) : 1;
         const limitNum = limit ? parseInt(limit, 10) : 5;
         return this.documentsService.findAll(pageNum, limitNum, title);
+    }
+    async findOne(id) {
+        return this.documentsService.findOne(id);
+    }
+    async getFile(id, res, download) {
+        const { data, fileName, mimeType } = await this.documentsService.getFile(id);
+        const isDownload = download !== undefined && download !== '0' && download !== 'false';
+        res.set({
+            'Content-Type': mimeType,
+            'Content-Length': String(data.length),
+            'Content-Disposition': (0, documents_service_1.buildContentDisposition)(isDownload ? 'attachment' : 'inline', fileName),
+        });
+        return new common_1.StreamableFile(data);
+    }
+    async getContent(id) {
+        return this.documentsService.getContent(id);
+    }
+    async backfillLocations(id, req) {
+        if (req.user.user_type !== 'ADMINISTRADOR') {
+            throw new common_1.ForbiddenException('Apenas administradores podem reprocessar documentos');
+        }
+        return this.ragService.backfillDocumentLocations(id);
     }
     async remove(id, req) {
         if (req.user.user_type !== 'ADMINISTRADOR') {
@@ -120,6 +160,54 @@ __decorate([
     __metadata("design:paramtypes", [String, String, String]),
     __metadata("design:returntype", Promise)
 ], DocumentsController.prototype, "findAll", null);
+__decorate([
+    (0, common_1.Get)(':id'),
+    (0, swagger_1.ApiOperation)({
+        summary: 'Metadados de um documento fonte (com links de consulta e download)',
+    }),
+    __param(0, (0, common_1.Param)('id')),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String]),
+    __metadata("design:returntype", Promise)
+], DocumentsController.prototype, "findOne", null);
+__decorate([
+    (0, common_1.Get)(':id/file'),
+    (0, swagger_1.ApiOperation)({
+        summary: 'Arquivo original do documento (visualizacao inline ou download)',
+    }),
+    (0, swagger_1.ApiQuery)({
+        name: 'download',
+        required: false,
+        description: 'Qualquer valor diferente de "0"/"false" forca o download',
+    }),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Res)({ passthrough: true })),
+    __param(2, (0, common_1.Query)('download')),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object, String]),
+    __metadata("design:returntype", Promise)
+], DocumentsController.prototype, "getFile", null);
+__decorate([
+    (0, common_1.Get)(':id/content'),
+    (0, swagger_1.ApiOperation)({
+        summary: 'Texto indexado do documento — sistema de coordenadas de char_start/char_end das fontes',
+    }),
+    __param(0, (0, common_1.Param)('id')),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String]),
+    __metadata("design:returntype", Promise)
+], DocumentsController.prototype, "getContent", null);
+__decorate([
+    (0, common_1.Post)(':id/locations/backfill'),
+    (0, swagger_1.ApiOperation)({
+        summary: 'Recalcula as coordenadas de um documento ja indexado (nao refaz embeddings)',
+    }),
+    __param(0, (0, common_1.Param)('id')),
+    __param(1, (0, common_1.Req)()),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:returntype", Promise)
+], DocumentsController.prototype, "backfillLocations", null);
 __decorate([
     (0, common_1.Delete)(':id'),
     (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),

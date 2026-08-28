@@ -35,15 +35,15 @@ model User {
 }
 
 model Conversation {
-  id         String   @id @default(uuid())
+  id         String    @id @default(uuid())
   user_id    String
   title      String
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  created_at DateTime  @default(now())
+  updated_at DateTime  @updatedAt
   is_pinned  Boolean   @default(false)
   deleted_at DateTime?
 
-  user               User                 @relation(fields: [user_id], references: [id])
+  user               User                  @relation(fields: [user_id], references: [id])
   interactionHistory InteractionHistory[]
   feedback           ConversationFeedback?
 
@@ -68,10 +68,46 @@ model ResponseSource {
   interaction_id String
   normative_id   String
 
-  interaction InteractionHistory @relation(fields: [interaction_id], references: [id])
-  normative   NormativeDocument  @relation(fields: [normative_id], references: [id])
+  interaction InteractionHistory      @relation(fields: [interaction_id], references: [id])
+  normative   NormativeDocument       @relation(fields: [normative_id], references: [id])
+  excerpts    ResponseSourceExcerpt[]
 
   @@map("response_sources")
+}
+
+// Rastreabilidade fina da fonte: um registro por TRECHO que efetivamente
+// entrou no prompt. ResponseSource continua sendo um registro por DOCUMENTO
+// (contrato preservado); os trechos penduram nele a localizacao dentro do
+// documento, permitindo que o historico reabra a resposta na mesma regiao.
+//
+// char_start/char_end sao offsets em NormativeDocument.indexed_content (ver
+// document-location.ts). Todos os campos de localizacao sao opcionais: um
+// documento indexado antes desta funcionalidade produz trechos sem
+// localizacao, e a fonte segue valida como referencia ao documento.
+model ResponseSourceExcerpt {
+  id                 String   @id @default(uuid())
+  response_source_id String
+  parent_chunk_id    String?
+  section_header     String?
+  n1_header          String?
+  n2_header          String?
+  citation           String?
+  excerpt            String
+  role               String?
+  rank               Int      @default(0)
+  page_start         Int?
+  page_end           Int?
+  char_start         Int?
+  char_end           Int?
+  location_precision String?
+  created_at         DateTime @default(now())
+
+  responseSource ResponseSource @relation(fields: [response_source_id], references: [id], onDelete: Cascade)
+  parentChunk    ParentChunk?   @relation(fields: [parent_chunk_id], references: [id], onDelete: SetNull)
+
+  @@index([response_source_id])
+  @@index([parent_chunk_id])
+  @@map("response_source_excerpts")
 }
 
 model ConversationFeedback {
@@ -96,10 +132,47 @@ model NormativeDocument {
   updated_at       DateTime  @updatedAt
   deleted_at       DateTime?
 
+  // Arquivo original preservado para visualizacao e download. Antes desta
+  // funcionalidade so o TEXTO extraido era guardado e o PDF era descartado
+  // apos a extracao — documentos enviados antes disso continuam validos, mas
+  // com file_name nulo (sem arquivo para baixar).
+  file_name      String?
+  file_mime_type String?
+  file_size      Int?
+  file_hash      String? // sha256 do arquivo original (integridade/auditoria)
+  file_data      Bytes? // NUNCA selecionar em listagens: e o PDF inteiro
+
+  // Texto limpo usado na indexacao. E o sistema de coordenadas de
+  // char_start/char_end (ParentChunk.metadata e ResponseSourceExcerpt) e o
+  // conteudo servido ao visualizador quando o arquivo original nao existe.
+  indexed_content String?
+  // Mapa de paginas: [{ page_start, page_end, start, end }] em coordenadas de
+  // indexed_content. Vazio/nulo quando a extracao nao preservou paginas.
+  page_map        Json?
+  total_pages     Int?
+
   admin           User             @relation(fields: [admin_id], references: [id])
   responseSources ResponseSource[]
+  parentChunks    ParentChunk[]
 
   @@map("normative_documents")
+}
+
+model ParentChunk {
+  id             String   @id @default(uuid())
+  document_id    String
+  section_header String
+  content        String
+  // Alem de documentId/title/n1_header/n2_header, guarda a localizacao do
+  // dispositivo no documento: char_start, char_end (offsets em
+  // indexed_content) e page_start, page_end quando as paginas sao conhecidas.
+  metadata       Json     @default("{}")
+  created_at     DateTime @default(now())
+
+  document NormativeDocument       @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  excerpts ResponseSourceExcerpt[]
+
+  @@map("parent_chunks")
 }
 
 model SystemAudit {
@@ -115,4 +188,3 @@ model SystemAudit {
 
   @@map("system_audits")
 }
-

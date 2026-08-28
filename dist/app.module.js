@@ -16,7 +16,6 @@ const config_1 = require("@nestjs/config");
 const users_module_1 = require("./users/users.module");
 const documents_module_1 = require("./documents/documents.module");
 const chat_module_1 = require("./chat/chat.module");
-const rag_service_1 = require("./rag/rag.service");
 let AppModule = class AppModule {
 };
 exports.AppModule = AppModule;
@@ -34,7 +33,7 @@ exports.AppModule = AppModule = __decorate([
             chat_module_1.ChatModule
         ],
         controllers: [app_controller_1.AppController],
-        providers: [app_service_1.AppService, rag_service_1.RagService],
+        providers: [app_service_1.AppService],
     })
 ], AppModule);
 //# sourceMappingURL=app.module.js.map
