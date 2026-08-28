@@ -40,6 +40,53 @@ O projeto segue a arquitetura modular do NestJS:
 4. Rode as migrations: `npx prisma migrate dev`
 5. Inicie: `npm run start:dev`
 
+## Fontes navegáveis (RAG)
+
+Toda resposta do RAG devolve `sources`: uma entrada por **documento** citado, com os **trechos** que fundamentaram a resposta e, quando os dados permitem, a **localização** de cada trecho dentro do documento.
+
+```jsonc
+{
+  "id": "uuid-do-documento",          // identificação inequívoca da fonte
+  "title": "IN 05/2017",
+  "document_type": "INSTRUCAO_NORMATIVA",
+  "total_pages": 42,
+  "file": { "available": true, "name": "in-05-2017.pdf", "mime_type": "application/pdf", "size": 918273 },
+  "view_url": "/api/documents/{id}/file",              // null quando não há arquivo original
+  "download_url": "/api/documents/{id}/file?download=1",
+  "content_url": "/api/documents/{id}/content",        // sempre disponível
+  "excerpts": [
+    {
+      "parent_chunk_id": "uuid-do-parent-chunk",
+      "citation": "Item 10.2 – ANEXO VIII-B – IN 05/2017",
+      "section_header": "10.2.", "n1_header": "ANEXO VIII-B", "n2_header": "10.2.",
+      "role": "PRINCIPAL",                              // ou COMPLEMENTAR
+      "excerpt": "texto exato enviado ao modelo",
+      "location": {                                     // null quando não determinável
+        "page_start": 12, "page_end": 12,
+        "char_start": 48210, "char_end": 48930,         // offsets em content_url
+        "precision": "TRECHO"                           // TRECHO | DISPOSITIVO
+      }
+    }
+  ]
+}
+```
+
+- `location: null` é um resultado legítimo: a fonte continua abrindo o documento. Nenhuma página ou posição é estimada.
+- `precision`: `TRECHO` = intervalo dos chunks que a busca vetorial recuperou; `DISPOSITIVO` = o item/artigo inteiro.
+- `char_start`/`char_end` são offsets no texto de `content_url` (`aligned_with_offsets: true`), não no PDF. Para destacar dentro do PDF, use `page_start` e busque o texto de `excerpt`.
+- O mesmo contrato volta em `GET /api/chat/history/:conversation_id` (campo `sources`), reconstruído do que foi persistido — sem refazer a recuperação.
+
+### Rotas de documento
+
+| Rota | Descrição |
+| --- | --- |
+| `GET /api/documents/:id` | Metadados da fonte + links |
+| `GET /api/documents/:id/file` | Arquivo original (inline); `?download=1` força download |
+| `GET /api/documents/:id/content` | Texto indexado + `page_map` (coordenadas das fontes) |
+| `POST /api/documents/:id/locations/backfill` | Admin: recalcula coordenadas de documento já indexado (não refaz embeddings) |
+
+Documentos enviados **antes** desta funcionalidade não têm arquivo original (`file.available: false`) nem páginas. O backfill recupera os offsets de caractere; páginas e localização por trecho exigem reenviar o PDF.
+
 ## Documentação
 
 Acesse a documentação interativa em:

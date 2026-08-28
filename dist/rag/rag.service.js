@@ -43,20 +43,23 @@ var __metadata = (this && this.__metadata) || function (k, v) {
 };
 var RagService_1;
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.RagService = exports.SECTION_HEADER_FALLBACK = void 0;
+exports.RagService = exports.buildCitation = exports.buildSourceLabel = exports.normalizeDocumentTitle = exports.SECTION_HEADER_FALLBACK = void 0;
 exports.normalizeForSearch = normalizeForSearch;
+exports.locationMetadata = locationMetadata;
 exports.findAnchorIndex = findAnchorIndex;
 exports.snapWindowStart = snapWindowStart;
 exports.snapWindowEnd = snapWindowEnd;
 exports.stripInvisibleArtifacts = stripInvisibleArtifacts;
+exports.collectAttestedWords = collectAttestedWords;
 exports.dehyphenateAttested = dehyphenateAttested;
-exports.normalizeDocumentTitle = normalizeDocumentTitle;
-exports.buildSourceLabel = buildSourceLabel;
+exports.cleanExtractedText = cleanExtractedText;
 exports.buildChunkEmbedText = buildChunkEmbedText;
 exports.buildRagPrompt = buildRagPrompt;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
 const legal_document_splitter_1 = require("./legal-document-splitter");
+const document_location_1 = require("./document-location");
+const response_sources_1 = require("./response-sources");
 const hierarchical_context_1 = require("./hierarchical-context");
 const google_genai_1 = require("@langchain/google-genai");
 const documents_1 = require("@langchain/core/documents");
@@ -125,6 +128,12 @@ function isPdfNoiseAllCaps(line) {
 function normalizeForSearch(text) {
     return text.replace(/\s+/g, ' ').trim();
 }
+function locationMetadata(range, pages) {
+    return {
+        ...(range ? { char_start: range.start, char_end: range.end } : {}),
+        ...(pages ? { page_start: pages.page_start, page_end: pages.page_end } : {}),
+    };
+}
 function trace(...args) {
     if (DEBUG_RAG)
         console.log(...args);
@@ -186,16 +195,20 @@ function stripInvisibleArtifacts(text) {
         out = out.replace(re, expanded);
     return out;
 }
-function dehyphenateAttested(text) {
+function collectAttestedWords(text) {
     const words = new Set();
     for (const token of text.split(/[^\p{L}]+/u)) {
         if (token.length >= 4)
             words.add(token.toLowerCase());
     }
+    return words;
+}
+function dehyphenateAttested(text, vocabulary) {
+    const words = vocabulary ?? collectAttestedWords(text);
     return text.replace(/(\p{L}{2,})-\n(\p{Ll}{2,})/gu, (match, a, b) => words.has(`${a}${b}`.toLowerCase()) ? `${a}${b}` : match);
 }
-function cleanExtractedText(raw) {
-    const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw));
+function cleanExtractedText(raw, vocabulary) {
+    const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw), vocabulary);
     return preprocessed
         .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
         .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
@@ -223,42 +236,12 @@ function resolveFinishReason(response) {
         response?.generationInfo?.finish_reason ??
         'unknown');
 }
-exports.SECTION_HEADER_FALLBACK = 'Secao';
-function normalizeDocumentTitle(title) {
-    const segments = title.split(/\s+[-–|]\s+/).map((s) => s.trim()).filter(Boolean);
-    if (segments.length <= 1)
-        return title.trim();
-    const seen = new Set();
-    const kept = [];
-    for (const segment of segments) {
-        const key = segment
-            .normalize('NFD')
-            .replace(/[̀-ͯ]/g, '')
-            .toLowerCase();
-        if (seen.has(key))
-            continue;
-        seen.add(key);
-        kept.push(segment);
-    }
-    return kept.join(' - ');
-}
-function buildSourceLabel(doc, index) {
-    const md = doc.metadata;
-    const title = typeof md.title === 'string' && md.title
-        ? normalizeDocumentTitle(md.title)
-        : 'Documento sem titulo';
-    const n1 = typeof md.n1_header === 'string' ? md.n1_header : '';
-    const n2 = typeof md.n2_header === 'string' ? md.n2_header : '';
-    const section = typeof md.sectionHeader === 'string' ? md.sectionHeader : '';
-    const parts = [`Documento: "${title}"`];
-    if (n1)
-        parts.push(n1);
-    const usableSection = section !== n1 && section !== exports.SECTION_HEADER_FALLBACK ? section : '';
-    const item = n2 || usableSection;
-    if (item)
-        parts.push(/^art/i.test(item) ? item : `Item ${item}`);
-    return `[Trecho ${index + 1}] ${parts.join(' | ')}`;
-}
+var source_citation_1 = require("./source-citation");
+Object.defineProperty(exports, "SECTION_HEADER_FALLBACK", { enumerable: true, get: function () { return source_citation_1.SECTION_HEADER_FALLBACK; } });
+Object.defineProperty(exports, "normalizeDocumentTitle", { enumerable: true, get: function () { return source_citation_1.normalizeDocumentTitle; } });
+Object.defineProperty(exports, "buildSourceLabel", { enumerable: true, get: function () { return source_citation_1.buildSourceLabel; } });
+Object.defineProperty(exports, "buildCitation", { enumerable: true, get: function () { return source_citation_1.buildCitation; } });
+const source_citation_2 = require("./source-citation");
 function buildChunkEmbedText(rawChild, ctx) {
     const parts = [];
     if (ctx.title?.trim())
@@ -275,7 +258,7 @@ function buildRagPrompt(contexts, userQuery) {
     const central = contexts.filter((d) => !isApoio(d));
     const apoio = contexts.filter(isApoio);
     let idx = 0;
-    const render = (doc) => `${buildSourceLabel(doc, idx++)}\n${doc.pageContent}`;
+    const render = (doc) => `${(0, source_citation_2.buildSourceLabel)(doc, idx++)}\n${doc.pageContent}`;
     const centralBlock = central.map(render).join('\n\n---\n\n');
     const apoioBlock = apoio.map(render).join('\n\n---\n\n');
     const contextBlock = apoio.length
@@ -489,24 +472,49 @@ let RagService = RagService_1 = class RagService {
         });
         this.logger.log('RAG Service inicializado (Gemini 2.5 + pgvector + PDR persistido)');
     }
-    async indexDocument(rawContent, documentId, title) {
-        const cleanedText = cleanExtractedText(rawContent);
+    async indexDocument(rawContent, documentId, title, pages) {
+        const vocabulary = collectAttestedWords(stripInvisibleArtifacts(rawContent));
+        const cleanedText = cleanExtractedText(rawContent, vocabulary);
         const chunks = (0, legal_document_splitter_1.splitLegalDocument)(cleanedText);
+        const docIndex = (0, document_location_1.buildNormalizedIndex)(cleanedText);
+        const pageMap = pages?.length
+            ? (0, document_location_1.buildPageMap)(docIndex, pages.map((page) => ({
+                page: page.page,
+                text: cleanExtractedText(page.text, vocabulary),
+            })))
+            : [];
+        const chunkRanges = (0, document_location_1.locateSequentialSegments)(docIndex, chunks.map((chunk) => chunk.content));
+        await this.prisma.normativeDocument.updateMany({
+            where: { id: documentId },
+            data: {
+                indexed_content: cleanedText,
+                page_map: pageMap.length
+                    ? pageMap
+                    : undefined,
+                total_pages: pages?.length
+                    ? Math.max(...pages.map((page) => page.page))
+                    : undefined,
+            },
+        });
         let totalChildren = 0;
+        let locatedSections = 0;
         const groupMap = new Map();
-        for (const chunk of chunks) {
+        chunks.forEach((chunk, i) => {
             const { n1_header, n2_header } = chunk.metadata;
             const key = `${n1_header}|||${n2_header}`;
             if (!groupMap.has(key)) {
                 groupMap.set(key, {
                     n1_header,
                     n2_header,
-                    sectionHeader: (n2_header || n1_header || exports.SECTION_HEADER_FALLBACK).slice(0, 255),
+                    sectionHeader: (n2_header || n1_header || source_citation_2.SECTION_HEADER_FALLBACK).slice(0, 255),
                     contentParts: [],
+                    partRanges: [],
                 });
             }
-            groupMap.get(key).contentParts.push(chunk.content);
-        }
+            const group = groupMap.get(key);
+            group.contentParts.push(chunk.content);
+            group.partRanges.push(chunkRanges[i]);
+        });
         const sectionHeadingByN1 = new Map();
         for (const entry of groupMap.values()) {
             if (entry.n2_header === '' &&
@@ -523,6 +531,10 @@ let RagService = RagService_1 = class RagService {
         const allChildDocs = [];
         for (const entry of groupMap.values()) {
             const fullContent = entry.contentParts.join('\n');
+            const locatedParts = (0, document_location_1.buildLocatedParts)(entry.contentParts, entry.partRanges);
+            const parentRange = (0, document_location_1.mergeRanges)(entry.partRanges);
+            if (parentRange)
+                locatedSections++;
             const savedParent = await this.prisma.parentChunk.create({
                 data: {
                     document_id: documentId,
@@ -533,21 +545,24 @@ let RagService = RagService_1 = class RagService {
                         title,
                         n1_header: entry.n1_header,
                         n2_header: entry.n2_header,
+                        ...locationMetadata(parentRange, (0, document_location_1.resolvePageSpan)(pageMap, parentRange)),
                     },
                 },
             });
-            const childContents = fullContent.length > legal_document_splitter_1.CHILD_CHUNK_SIZE
-                ? (0, legal_document_splitter_1.splitIntoChildChunks)(fullContent)
-                : [fullContent];
-            for (const childContent of childContents) {
+            const childChunks = fullContent.length > legal_document_splitter_1.CHILD_CHUNK_SIZE
+                ? (0, legal_document_splitter_1.splitIntoChildChunksWithOffsets)(fullContent)
+                : [{ content: fullContent, start: 0, end: fullContent.length }];
+            for (const child of childChunks) {
+                const childRange = (0, document_location_1.locateInDocument)(docIndex, locatedParts, child.start, child.end);
                 allChildDocs.push(new documents_1.Document({
-                    pageContent: childContent,
+                    pageContent: child.content,
                     metadata: {
                         documentId,
                         title,
                         parentId: savedParent.id,
                         n1_header: entry.n1_header,
                         n2_header: entry.n2_header,
+                        ...locationMetadata(childRange, (0, document_location_1.resolvePageSpan)(pageMap, childRange)),
                     },
                 }));
             }
@@ -590,13 +605,54 @@ let RagService = RagService_1 = class RagService {
             if (i < batches.length - 1)
                 await delay(EMBEDDING_BATCH_DELAY);
         }
-        this.logger.log(`Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados`);
+        this.logger.log(`Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados, ` +
+            `${locatedSections}/${groupMap.size} secoes localizadas, ${pageMap.length} faixa(s) de pagina`);
         return {
             success: true,
             documentId,
             sections: groupMap.size,
             childChunks: totalChildren,
+            pagesMapped: pageMap.length,
+            locatedSections,
         };
+    }
+    async backfillDocumentLocations(documentId) {
+        const document = await this.prisma.normativeDocument.findUnique({
+            where: { id: documentId },
+            select: { id: true, original_content: true },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Documento nao encontrado');
+        }
+        const cleanedText = cleanExtractedText(document.original_content);
+        const docIndex = (0, document_location_1.buildNormalizedIndex)(cleanedText);
+        const parents = await this.prisma.parentChunk.findMany({
+            where: { document_id: documentId },
+            orderBy: { created_at: 'asc' },
+        });
+        const ranges = (0, document_location_1.locateSequentialSegments)(docIndex, parents.map((parent) => parent.content));
+        let located = 0;
+        for (let i = 0; i < parents.length; i++) {
+            const range = ranges[i];
+            if (!range)
+                continue;
+            located++;
+            await this.prisma.parentChunk.update({
+                where: { id: parents[i].id },
+                data: {
+                    metadata: {
+                        ...(parents[i].metadata ?? {}),
+                        ...locationMetadata(range, null),
+                    },
+                },
+            });
+        }
+        await this.prisma.normativeDocument.update({
+            where: { id: documentId },
+            data: { indexed_content: cleanedText },
+        });
+        this.logger.log(`[RAG] Backfill de localizacao em ${documentId}: ${located}/${parents.length} parents localizados`);
+        return { documentId, parents: parents.length, located };
     }
     async retrieveParentContexts(userQuery, k = RETRIEVAL_FETCH_K) {
         const queryVec = await this.embeddings.embedQuery(userQuery);
@@ -884,6 +940,10 @@ let RagService = RagService_1 = class RagService {
                     pageContent = `${prefix}${slice}${suffix}`;
                 }
             }
+            const parentRange = (0, document_location_1.readCharRange)(row.metadata);
+            const parentPages = (0, document_location_1.readPageSpan)(row.metadata);
+            const excerptRange = (0, document_location_1.mergeRanges)(triggeringChildren.map((child) => (0, document_location_1.readCharRange)(child.metadata)));
+            const excerptPages = (0, document_location_1.mergePageSpans)(triggeringChildren.map((child) => (0, document_location_1.readPageSpan)(child.metadata)));
             return new documents_1.Document({
                 pageContent,
                 metadata: {
@@ -894,6 +954,24 @@ let RagService = RagService_1 = class RagService {
                     sectionHeader: row.section_header,
                     parentId: row.id,
                     role: roleById.get(row.id) ?? 'PRINCIPAL',
+                    ...(parentRange
+                        ? { charStart: parentRange.start, charEnd: parentRange.end }
+                        : {}),
+                    ...(parentPages
+                        ? { pageStart: parentPages.page_start, pageEnd: parentPages.page_end }
+                        : {}),
+                    ...(excerptRange
+                        ? {
+                            excerptCharStart: excerptRange.start,
+                            excerptCharEnd: excerptRange.end,
+                        }
+                        : {}),
+                    ...(excerptPages
+                        ? {
+                            excerptPageStart: excerptPages.page_start,
+                            excerptPageEnd: excerptPages.page_end,
+                        }
+                        : {}),
                 },
             });
         });
@@ -905,6 +983,23 @@ let RagService = RagService_1 = class RagService {
             .map((doc) => doc.metadata.documentId)
             .filter((id) => Boolean(id))));
         return { parents, sourceDocIds };
+    }
+    async loadSourceDocuments(documentIds) {
+        if (documentIds.length === 0)
+            return new Map();
+        const rows = await this.prisma.normativeDocument.findMany({
+            where: { id: { in: documentIds } },
+            select: {
+                id: true,
+                title: true,
+                document_type: true,
+                total_pages: true,
+                file_name: true,
+                file_mime_type: true,
+                file_size: true,
+            },
+        });
+        return new Map(rows.map((row) => [row.id, row]));
     }
     async query(userQuery, conversationId) {
         const { parents, sourceDocIds } = await this.retrieveParentContexts(userQuery);
@@ -948,22 +1043,35 @@ let RagService = RagService_1 = class RagService {
             aiResponse +=
                 '\n\n(Observacao do sistema: esta resposta pode ter sido interrompida por limite de tamanho e talvez nao cubra todos os itens. Refaca a pergunta de forma mais especifica para obter o restante.)';
         }
-        const sourcesMap = new Map();
-        for (const parent of parents) {
-            const id = parent.metadata.documentId;
-            const title = parent.metadata.title;
-            if (id && !sourcesMap.has(id))
-                sourcesMap.set(id, { id, title });
-        }
-        const sources = Array.from(sourcesMap.values());
+        const sources = (0, response_sources_1.buildResponseSources)(parents.map((doc) => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata,
+        })), await this.loadSourceDocuments(sourceDocIds));
         const saved = await this.prisma.interactionHistory.create({
             data: {
                 conversation_id: conversationId,
                 user_query: userQuery,
                 ai_response: aiResponse,
                 responseSources: {
-                    create: sourceDocIds.map((id) => ({
-                        normative: { connect: { id } },
+                    create: sources.map((source) => ({
+                        normative: { connect: { id: source.id } },
+                        excerpts: {
+                            create: source.excerpts.map((excerpt, rank) => ({
+                                parent_chunk_id: excerpt.parent_chunk_id,
+                                section_header: excerpt.section_header,
+                                n1_header: excerpt.n1_header,
+                                n2_header: excerpt.n2_header,
+                                citation: excerpt.citation,
+                                excerpt: excerpt.excerpt,
+                                role: excerpt.role,
+                                rank,
+                                page_start: excerpt.location?.page_start ?? null,
+                                page_end: excerpt.location?.page_end ?? null,
+                                char_start: excerpt.location?.char_start ?? null,
+                                char_end: excerpt.location?.char_end ?? null,
+                                location_precision: excerpt.location?.precision ?? null,
+                            })),
+                        },
                     })),
                 },
             },

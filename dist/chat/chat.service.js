@@ -12,6 +12,16 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ChatService = void 0;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
+const response_sources_1 = require("../rag/response-sources");
+const HISTORY_NORMATIVE_SELECT = {
+    id: true,
+    title: true,
+    document_type: true,
+    total_pages: true,
+    file_name: true,
+    file_mime_type: true,
+    file_size: true,
+};
 let ChatService = class ChatService {
     prisma;
     constructor(prisma) {
@@ -70,30 +80,50 @@ let ChatService = class ChatService {
         };
     }
     async getConversationWithHistory(id) {
-        return this.prisma.conversation.findUnique({
+        const conversation = await this.prisma.conversation.findUnique({
             where: { id },
             include: {
                 interactionHistory: {
-                    orderBy: { created_at: 'asc' }
-                }
-            }
-        });
-    }
-    async getHistory(conversation_id, user_id) {
-        await this.validateConversation(conversation_id, user_id);
-        return this.prisma.interactionHistory.findMany({
-            where: { conversation_id },
-            orderBy: { created_at: 'asc' },
-            include: {
-                responseSources: {
+                    orderBy: { created_at: 'asc' },
                     include: {
-                        normative: {
-                            select: { title: true, document_type: true },
+                        responseSources: {
+                            include: {
+                                normative: { select: HISTORY_NORMATIVE_SELECT },
+                                excerpts: { orderBy: { rank: 'asc' } },
+                            },
                         },
                     },
                 },
             },
         });
+        if (!conversation)
+            return conversation;
+        return {
+            ...conversation,
+            interactionHistory: conversation.interactionHistory.map((interaction) => ({
+                ...interaction,
+                sources: (0, response_sources_1.buildHistorySources)(interaction.responseSources),
+            })),
+        };
+    }
+    async getHistory(conversation_id, user_id) {
+        await this.validateConversation(conversation_id, user_id);
+        const interactions = await this.prisma.interactionHistory.findMany({
+            where: { conversation_id },
+            orderBy: { created_at: 'asc' },
+            include: {
+                responseSources: {
+                    include: {
+                        normative: { select: HISTORY_NORMATIVE_SELECT },
+                        excerpts: { orderBy: { rank: 'asc' } },
+                    },
+                },
+            },
+        });
+        return interactions.map((interaction) => ({
+            ...interaction,
+            sources: (0, response_sources_1.buildHistorySources)(interaction.responseSources),
+        }));
     }
     async renameConversation(id, title) {
         return this.prisma.conversation.update({

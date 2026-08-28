@@ -1,5 +1,18 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { buildHistorySources } from '../rag/response-sources';
+
+// Campos do documento necessarios para montar uma fonte navegavel a partir do
+// historico. Nunca inclui file_data (o PDF inteiro) nem os textos completos.
+const HISTORY_NORMATIVE_SELECT = {
+  id: true,
+  title: true,
+  document_type: true,
+  total_pages: true,
+  file_name: true,
+  file_mime_type: true,
+  file_size: true,
+} as const;
 
 @Injectable()
 export class ChatService {
@@ -65,32 +78,57 @@ export class ChatService {
   }
 
   async getConversationWithHistory(id: string) {
-    return this.prisma.conversation.findUnique({
+    const conversation = await this.prisma.conversation.findUnique({
       where: { id },
       include: {
         interactionHistory: {
-          orderBy: { created_at: 'asc' }
-        }
-      }
-    });
-  }
-
-  async getHistory(conversation_id: string, user_id: string) {
-    await this.validateConversation(conversation_id, user_id);
-
-    return this.prisma.interactionHistory.findMany({
-      where: { conversation_id },
-      orderBy: { created_at: 'asc' },
-      include: {
-        responseSources: {
+          orderBy: { created_at: 'asc' },
           include: {
-            normative: {
-              select: { title: true, document_type: true },
+            responseSources: {
+              include: {
+                normative: { select: HISTORY_NORMATIVE_SELECT },
+                excerpts: { orderBy: { rank: 'asc' } },
+              },
             },
           },
         },
       },
     });
+    if (!conversation) return conversation;
+
+    return {
+      ...conversation,
+      interactionHistory: conversation.interactionHistory.map((interaction) => ({
+        ...interaction,
+        sources: buildHistorySources(interaction.responseSources),
+      })),
+    };
+  }
+
+  async getHistory(conversation_id: string, user_id: string) {
+    await this.validateConversation(conversation_id, user_id);
+
+    const interactions = await this.prisma.interactionHistory.findMany({
+      where: { conversation_id },
+      orderBy: { created_at: 'asc' },
+      include: {
+        responseSources: {
+          include: {
+            normative: { select: HISTORY_NORMATIVE_SELECT },
+            excerpts: { orderBy: { rank: 'asc' } },
+          },
+        },
+      },
+    });
+
+    // `responseSources` continua exatamente como estava (agora com os trechos
+    // aninhados); `sources` acrescenta o MESMO contrato que /chat/ask devolve,
+    // para que reabrir uma conversa entregue fontes navegaveis identicas as da
+    // resposta original — sem refazer nenhuma recuperacao.
+    return interactions.map((interaction) => ({
+      ...interaction,
+      sources: buildHistorySources(interaction.responseSources),
+    }));
   }
   
   async renameConversation(id: string, title: string) {

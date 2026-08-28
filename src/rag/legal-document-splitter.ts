@@ -352,14 +352,31 @@ export interface HierarchicalChunk {
   };
 }
 
-export function splitIntoChildChunks(text: string): string[] {
-  const chunks: string[] = [];
+/**
+ * Child chunk com a sua posicao [start, end) dentro do texto do parent.
+ * As posicoes sao consequencia direta da janela deslizante — nao ha busca nem
+ * heuristica — e sao o que permite localizar no documento a regiao que a busca
+ * vetorial de fato recuperou.
+ */
+export interface ChildChunk {
+  content: string;
+  start: number;
+  end: number;
+}
+
+export function splitIntoChildChunksWithOffsets(text: string): ChildChunk[] {
+  const chunks: ChildChunk[] = [];
   let start = 0;
   while (start < text.length) {
-    chunks.push(text.slice(start, start + CHILD_CHUNK_SIZE));
+    const end = Math.min(start + CHILD_CHUNK_SIZE, text.length);
+    chunks.push({ content: text.slice(start, end), start, end });
     start += CHILD_CHUNK_SIZE - CHILD_CHUNK_OVERLAP;
   }
   return chunks;
+}
+
+export function splitIntoChildChunks(text: string): string[] {
+  return splitIntoChildChunksWithOffsets(text).map((chunk) => chunk.content);
 }
 
 /**

@@ -1,11 +1,38 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  OnModuleInit,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   splitLegalDocument,
   parseItemNumber,
-  splitIntoChildChunks,
+  splitIntoChildChunksWithOffsets,
   CHILD_CHUNK_SIZE,
+  type ChildChunk,
 } from './legal-document-splitter';
+import {
+  buildLocatedParts,
+  buildNormalizedIndex,
+  buildPageMap,
+  locateInDocument,
+  locateSequentialSegments,
+  mergePageSpans,
+  mergeRanges,
+  readCharRange,
+  readPageSpan,
+  resolvePageSpan,
+  type CharRange,
+  type PageInput,
+  type PageSpan,
+} from './document-location';
+import {
+  buildResponseSources,
+  type ResponseSource,
+  type SourceDocumentInfo,
+} from './response-sources';
 import {
   buildClusters,
   applyHierarchicalBoost,
@@ -174,6 +201,24 @@ export function normalizeForSearch(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+// ---------------------------------------------------------------------------
+// locationMetadata
+//
+// Campos de localizacao acrescentados ao metadata de parents e children. Chaves
+// ausentes significam "nao foi possivel localizar" — nunca zero, nunca uma
+// pagina estimada: um trecho sem localizacao continua sendo uma fonte valida,
+// mas o frontend nao deve levar o usuario a lugar nenhum por conta propria.
+// ---------------------------------------------------------------------------
+export function locationMetadata(
+  range: CharRange | null,
+  pages: PageSpan | null,
+): Record<string, number> {
+  return {
+    ...(range ? { char_start: range.start, char_end: range.end } : {}),
+    ...(pages ? { page_start: pages.page_start, page_end: pages.page_end } : {}),
+  };
+}
+
 // Log de TRACE condicionado a DEBUG_RAG — evita custo/ruido de console.log
 // em producao (os TRACEs incluem dumps de embedding e do contexto completo).
 function trace(...args: unknown[]): void {
@@ -271,16 +316,28 @@ export function stripInvisibleArtifacts(text: string): string {
   return out;
 }
 
+// Vocabulario de atestacao da de-hifenizacao. Extraido em separado para que a
+// limpeza de UMA pagina possa usar o vocabulario do documento INTEIRO: sem
+// isso, "fiscali-\nzacao" seria unido no texto completo e mantido na pagina
+// isolada, e as duas versoes deixariam de casar no mapeamento de paginas.
+export function collectAttestedWords(text: string): Set<string> {
+  const words = new Set<string>();
+  for (const token of text.split(/[^\p{L}]+/u)) {
+    if (token.length >= 4) words.add(token.toLowerCase());
+  }
+  return words;
+}
+
 // De-hifenizacao ATESTADA pelo proprio documento: une "fiscali-\nzacao" ->
 // "fiscalizacao" SOMENTE se a palavra unida ocorre integra em algum outro
 // ponto do texto. Sem atestado, o trecho fica exatamente como estava — nada
 // e inventado. Compostos legitimos quebrados no proprio hifen ("decreto-\nlei")
 // nao sao unidos, pois "decretolei" nao ocorre no documento.
-export function dehyphenateAttested(text: string): string {
-  const words = new Set<string>();
-  for (const token of text.split(/[^\p{L}]+/u)) {
-    if (token.length >= 4) words.add(token.toLowerCase());
-  }
+export function dehyphenateAttested(
+  text: string,
+  vocabulary?: Set<string>,
+): string {
+  const words = vocabulary ?? collectAttestedWords(text);
   return text.replace(
     /(\p{L}{2,})-\n(\p{Ll}{2,})/gu,
     (match, a: string, b: string) =>
@@ -288,8 +345,14 @@ export function dehyphenateAttested(text: string): string {
   );
 }
 
-function cleanExtractedText(raw: string): string {
-  const preprocessed = dehyphenateAttested(stripInvisibleArtifacts(raw));
+export function cleanExtractedText(
+  raw: string,
+  vocabulary?: Set<string>,
+): string {
+  const preprocessed = dehyphenateAttested(
+    stripInvisibleArtifacts(raw),
+    vocabulary,
+  );
   return preprocessed
     .replace(/^\s*[-–]?\s*\d+\s*[-–]?\s*$/gm, '')
     .replace(/^\s*[Pp]ágina\s+\d+\s+de\s+\d+\s*$/gm, '')
@@ -335,80 +398,17 @@ function resolveFinishReason(response: any): string {
   );
 }
 
-// ---------------------------------------------------------------------------
-// buildSourceLabel
-//
-// Monta o cabecalho estrutural de cada fonte no prompt a partir dos metadados
-// que ja chegam no Document (title, n1_header, n2_header, sectionHeader).
-// Ex: [Fonte 1] Documento: "Edital X" | ANEXO VIII-B | Item 10.2.
-//
-// "Fonte N" e apenas o identificador posicional do bloco dentro do prompt;
-// o modelo e instruido a citar SEMPRE pela referencia estrutural (documento,
-// anexo, item), que e estavel e rastreavel fora desta requisicao.
-// ---------------------------------------------------------------------------
-// Rotulo sintetico dado pela ingestao ao grupo de PREAMBULO — o texto que
-// antecede qualquer cabecalho estrutural (capa e qualificacao das partes num
-// contrato, ementa de uma norma). Nao e a designacao de um item real, entao
-// nunca deve ser citado como "Item Secao" na resposta.
-export const SECTION_HEADER_FALLBACK = 'Secao';
-
-// ---------------------------------------------------------------------------
-// normalizeDocumentTitle
-//
-// O titulo vem do upload (tipicamente o nome do arquivo ou o titulo extraido da
-// pagina de origem) e costuma trazer o MESMO segmento repetido — artefato de
-// exportacao: "LEI X - LEI X - DOU - Imprensa Nacional". O segmento repetido
-// nao carrega informacao e polui a citacao que o modelo reproduz na resposta.
-// Removemos apenas duplicatas exatas (comparacao sem acento/caixa) preservando
-// a ordem e o primeiro exemplar de cada segmento; nada de conteudo e inventado
-// ou descartado por juizo semantico.
-// ---------------------------------------------------------------------------
-export function normalizeDocumentTitle(title: string): string {
-  const segments = title.split(/\s+[-–|]\s+/).map((s) => s.trim()).filter(Boolean);
-  if (segments.length <= 1) return title.trim();
-
-  const seen = new Set<string>();
-  const kept: string[] = [];
-  for (const segment of segments) {
-    const key = segment
-      .normalize('NFD')
-      .replace(/[̀-ͯ]/g, '')
-      .toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    kept.push(segment);
-  }
-  return kept.join(' - ');
-}
-
-export function buildSourceLabel(doc: Document, index: number): string {
-  const md = doc.metadata as Record<string, unknown>;
-  const title =
-    typeof md.title === 'string' && md.title
-      ? normalizeDocumentTitle(md.title)
-      : 'Documento sem titulo';
-  const n1 = typeof md.n1_header === 'string' ? md.n1_header : '';
-  const n2 = typeof md.n2_header === 'string' ? md.n2_header : '';
-  const section = typeof md.sectionHeader === 'string' ? md.sectionHeader : '';
-
-  const parts: string[] = [`Documento: "${title}"`];
-  if (n1) parts.push(n1);
-
-  // n2 e o item ("10.2.") ou artigo ("Art. 39"); sem n2, usa sectionHeader
-  // quando ele nao repete o n1 e nao e o rotulo sintetico de preambulo — este
-  // ultimo nao designa item algum, e citar "Item Secao" seria inventar uma
-  // referencia que nao existe no documento.
-  const usableSection =
-    section !== n1 && section !== SECTION_HEADER_FALLBACK ? section : '';
-  const item = n2 || usableSection;
-  if (item) parts.push(/^art/i.test(item) ? item : `Item ${item}`);
-
-  // A prioridade definida no retrieval (metadado role PRINCIPAL/COMPLEMENTAR)
-  // NAO e renderizada no rotulo: a ordem dos trechos ja carrega o sinal (o
-  // primeiro e o mais pertinente) e vocabulario interno do pipeline nao deve
-  // induzir a resposta a falar em "fontes principais/complementares".
-  return `[Trecho ${index + 1}] ${parts.join(' | ')}`;
-}
+// A formatacao da referencia estrutural (rotulo do prompt e citacao da fonte)
+// vive em source-citation.ts, compartilhada com o DTO de fontes e o historico.
+// Re-exportada aqui porque rag.service segue sendo o ponto de entrada do
+// pipeline para quem importa essas funcoes.
+export {
+  SECTION_HEADER_FALLBACK,
+  normalizeDocumentTitle,
+  buildSourceLabel,
+  buildCitation,
+} from './source-citation';
+import { buildSourceLabel, SECTION_HEADER_FALLBACK } from './source-citation';
 
 // ---------------------------------------------------------------------------
 // buildChunkEmbedText
@@ -688,32 +688,86 @@ export class RagService implements OnModuleInit {
 
   // -------------------------------------------------------------------------
   // Ingestao: limpeza -> chunking -> persiste parents no PG -> indexa children
+  //
+  // `pages` (opcional) sao as paginas do PDF na ordem de extracao. Elas NAO
+  // participam do chunking — o texto dividido continua sendo exatamente o
+  // mesmo de antes — e servem so para construir o mapa de paginas que da
+  // localizacao as fontes. Sem elas, a indexacao roda igual e os trechos ficam
+  // com localizacao por caractere, sem pagina.
   // -------------------------------------------------------------------------
   async indexDocument(
     rawContent: string,
     documentId: string,
     title: string,
+    pages?: PageInput[],
   ): Promise<{
     success: boolean;
     documentId: string;
     sections: number;
     childChunks: number;
+    pagesMapped: number;
+    locatedSections: number;
   }> {
-    const cleanedText = cleanExtractedText(rawContent);
+    // O vocabulario de de-hifenizacao vem do documento INTEIRO e e reaproveitado
+    // na limpeza de cada pagina: limpar a pagina isolada com outro vocabulario
+    // produziria um texto que nao casa com o do documento e o mapa de paginas
+    // se perderia.
+    const vocabulary = collectAttestedWords(stripInvisibleArtifacts(rawContent));
+    const cleanedText = cleanExtractedText(rawContent, vocabulary);
     const chunks = splitLegalDocument(cleanedText);
 
+    // Coordenadas de tudo o que e localizado daqui para baixo: offsets neste
+    // texto limpo, guardado em NormativeDocument.indexed_content.
+    const docIndex = buildNormalizedIndex(cleanedText);
+    const pageMap = pages?.length
+      ? buildPageMap(
+          docIndex,
+          pages.map((page) => ({
+            page: page.page,
+            text: cleanExtractedText(page.text, vocabulary),
+          })),
+        )
+      : [];
+
+    // Cada chunk emitido pelo splitter e localizado uma unica vez, em ordem —
+    // e o cursor monotonico de locateSequentialSegments que faz dispositivos de
+    // texto identico (frequentes em normas) caiam cada um no seu lugar.
+    const chunkRanges = locateSequentialSegments(
+      docIndex,
+      chunks.map((chunk) => chunk.content),
+    );
+
+    // Persistido ANTES da vetorizacao (lenta e sujeita a rate limit): o
+    // visualizador e as coordenadas das fontes nao dependem dos embeddings.
+    // updateMany nao falha quando o documento nao existe — indexDocument
+    // tambem e chamado em cenarios de teste/reprocessamento avulso.
+    await this.prisma.normativeDocument.updateMany({
+      where: { id: documentId },
+      data: {
+        indexed_content: cleanedText,
+        page_map: pageMap.length
+          ? (pageMap as unknown as Prisma.InputJsonValue)
+          : undefined,
+        total_pages: pages?.length
+          ? Math.max(...pages.map((page) => page.page))
+          : undefined,
+      },
+    });
+
     let totalChildren = 0;
+    let locatedSections = 0;
 
     type GroupEntry = {
       n1_header: string;
       n2_header: string;
       sectionHeader: string;
       contentParts: string[];
+      partRanges: Array<CharRange | null>;
     };
 
     const groupMap = new Map<string, GroupEntry>();
 
-    for (const chunk of chunks) {
+    chunks.forEach((chunk, i) => {
       const { n1_header, n2_header } = chunk.metadata;
       const key = `${n1_header}|||${n2_header}`;
 
@@ -723,11 +777,14 @@ export class RagService implements OnModuleInit {
           n2_header,
           sectionHeader: (n2_header || n1_header || SECTION_HEADER_FALLBACK).slice(0, 255),
           contentParts: [],
+          partRanges: [],
         });
       }
 
-      groupMap.get(key)!.contentParts.push(chunk.content);
-    }
+      const group = groupMap.get(key)!;
+      group.contentParts.push(chunk.content);
+      group.partRanges.push(chunkRanges[i]);
+    });
 
     // Cabecalho descritivo de cada anexo/secao = o grupo de "preambulo" (sem
     // item, n2 vazio), cujo conteudo costuma trazer o tema da secao. Serve
@@ -762,6 +819,10 @@ export class RagService implements OnModuleInit {
       // substring exata do parent e o parent nunca contem texto duplicado.
       const fullContent = entry.contentParts.join('\n');
 
+      const locatedParts = buildLocatedParts(entry.contentParts, entry.partRanges);
+      const parentRange = mergeRanges(entry.partRanges);
+      if (parentRange) locatedSections++;
+
       const savedParent = await this.prisma.parentChunk.create({
         data: {
           document_id: documentId,
@@ -772,25 +833,38 @@ export class RagService implements OnModuleInit {
             title,
             n1_header: entry.n1_header,
             n2_header: entry.n2_header,
+            ...locationMetadata(parentRange, resolvePageSpan(pageMap, parentRange)),
           },
         },
       });
 
-      const childContents =
+      const childChunks: ChildChunk[] =
         fullContent.length > CHILD_CHUNK_SIZE
-          ? splitIntoChildChunks(fullContent)
-          : [fullContent];
+          ? splitIntoChildChunksWithOffsets(fullContent)
+          : [{ content: fullContent, start: 0, end: fullContent.length }];
 
-      for (const childContent of childContents) {
+      for (const child of childChunks) {
+        // Localizacao do PROPRIO child: e ele que a busca vetorial recupera, e
+        // e a regiao dele que fundamenta a resposta. A janela do child e
+        // conhecida por construcao (offsets da janela deslizante), entao a
+        // conversao para as coordenadas do documento e deterministica.
+        const childRange = locateInDocument(
+          docIndex,
+          locatedParts,
+          child.start,
+          child.end,
+        );
+
         allChildDocs.push(
           new Document({
-            pageContent: childContent,
+            pageContent: child.content,
             metadata: {
               documentId,
               title,
               parentId: savedParent.id,
               n1_header: entry.n1_header,
               n2_header: entry.n2_header,
+              ...locationMetadata(childRange, resolvePageSpan(pageMap, childRange)),
             },
           }),
         );
@@ -848,7 +922,8 @@ export class RagService implements OnModuleInit {
     }
 
     this.logger.log(
-      `Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados`,
+      `Indexado: "${title}" — ${groupMap.size} parents consolidados, ${totalChildren} child chunks vetorizados, ` +
+        `${locatedSections}/${groupMap.size} secoes localizadas, ${pageMap.length} faixa(s) de pagina`,
     );
 
     return {
@@ -856,7 +931,78 @@ export class RagService implements OnModuleInit {
       documentId,
       sections: groupMap.size,
       childChunks: totalChildren,
+      pagesMapped: pageMap.length,
+      locatedSections,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // backfillDocumentLocations
+  //
+  // Recalcula as COORDENADAS de um documento ja indexado, sem tocar nos
+  // embeddings, nos ParentChunks ou no retrieval: reconstroi o texto limpo a
+  // partir de original_content e localiza cada ParentChunk existente nele.
+  //
+  // O que isto recupera para documentos antigos: o texto indexado (para o
+  // visualizador) e char_start/char_end de cada dispositivo. O que NAO
+  // recupera: paginas (a extracao antiga concatenava as paginas e a divisao se
+  // perdeu) e a localizacao fina por child chunk (esta vive nos vetores). Para
+  // esses dois, so reenviando o documento.
+  // -------------------------------------------------------------------------
+  async backfillDocumentLocations(documentId: string): Promise<{
+    documentId: string;
+    parents: number;
+    located: number;
+  }> {
+    const document = await this.prisma.normativeDocument.findUnique({
+      where: { id: documentId },
+      select: { id: true, original_content: true },
+    });
+    if (!document) {
+      throw new NotFoundException('Documento nao encontrado');
+    }
+
+    const cleanedText = cleanExtractedText(document.original_content);
+    const docIndex = buildNormalizedIndex(cleanedText);
+
+    // A ordem de criacao dos parents e a ordem em que o splitter os emitiu, que
+    // e a ordem do documento — condicao do cursor monotonico da localizacao.
+    const parents = await this.prisma.parentChunk.findMany({
+      where: { document_id: documentId },
+      orderBy: { created_at: 'asc' },
+    });
+
+    const ranges = locateSequentialSegments(
+      docIndex,
+      parents.map((parent) => parent.content),
+    );
+
+    let located = 0;
+    for (let i = 0; i < parents.length; i++) {
+      const range = ranges[i];
+      if (!range) continue;
+      located++;
+      await this.prisma.parentChunk.update({
+        where: { id: parents[i].id },
+        data: {
+          metadata: {
+            ...((parents[i].metadata as Prisma.JsonObject) ?? {}),
+            ...locationMetadata(range, null),
+          },
+        },
+      });
+    }
+
+    await this.prisma.normativeDocument.update({
+      where: { id: documentId },
+      data: { indexed_content: cleanedText },
+    });
+
+    this.logger.log(
+      `[RAG] Backfill de localizacao em ${documentId}: ${located}/${parents.length} parents localizados`,
+    );
+
+    return { documentId, parents: parents.length, located };
   }
 
   private async retrieveParentContexts(
@@ -1346,6 +1492,23 @@ export class RagService implements OnModuleInit {
         }
       }
 
+      // Localizacao no documento, do mais fino para o mais grosso:
+      //   - excerpt*: uniao dos child chunks que a busca vetorial recuperou —
+      //     a regiao que de fato fundamentou a resposta;
+      //   - char*/page*: o dispositivo inteiro (ParentChunk).
+      // Ambas vem de metadados gravados na ingestao; nada e recalculado nem
+      // estimado aqui. Um dispositivo trazido pela expansao hierarquica nao tem
+      // child recuperado e fica so com a localizacao do dispositivo; um
+      // documento indexado antes desta funcionalidade nao tem nenhuma das duas.
+      const parentRange = readCharRange(row.metadata);
+      const parentPages = readPageSpan(row.metadata);
+      const excerptRange = mergeRanges(
+        triggeringChildren.map((child) => readCharRange(child.metadata)),
+      );
+      const excerptPages = mergePageSpans(
+        triggeringChildren.map((child) => readPageSpan(child.metadata)),
+      );
+
       return new Document({
         pageContent,
         metadata: {
@@ -1356,6 +1519,24 @@ export class RagService implements OnModuleInit {
           sectionHeader: row.section_header,
           parentId: row.id,
           role: roleById.get(row.id) ?? 'PRINCIPAL',
+          ...(parentRange
+            ? { charStart: parentRange.start, charEnd: parentRange.end }
+            : {}),
+          ...(parentPages
+            ? { pageStart: parentPages.page_start, pageEnd: parentPages.page_end }
+            : {}),
+          ...(excerptRange
+            ? {
+                excerptCharStart: excerptRange.start,
+                excerptCharEnd: excerptRange.end,
+              }
+            : {}),
+          ...(excerptPages
+            ? {
+                excerptPageStart: excerptPages.page_start,
+                excerptPageEnd: excerptPages.page_end,
+              }
+            : {}),
         },
       });
     });
@@ -1384,6 +1565,28 @@ export class RagService implements OnModuleInit {
     return { parents, sourceDocIds };
   }
 
+  // Dados dos documentos-fonte necessarios para montar as fontes navegaveis.
+  // NUNCA seleciona file_data: e o PDF inteiro, servido apenas pela rota de
+  // download sob demanda.
+  private async loadSourceDocuments(
+    documentIds: string[],
+  ): Promise<Map<string, SourceDocumentInfo>> {
+    if (documentIds.length === 0) return new Map();
+    const rows = await this.prisma.normativeDocument.findMany({
+      where: { id: { in: documentIds } },
+      select: {
+        id: true,
+        title: true,
+        document_type: true,
+        total_pages: true,
+        file_name: true,
+        file_mime_type: true,
+        file_size: true,
+      },
+    });
+    return new Map(rows.map((row) => [row.id, row]));
+  }
+
   async query(
     userQuery: string,
     conversationId: string,
@@ -1391,7 +1594,7 @@ export class RagService implements OnModuleInit {
     id: string;
     created_at: Date;
     response: string;
-    sources: { id: string; title: string }[];
+    sources: ResponseSource[];
   }> {
     const { parents, sourceDocIds } =
       await this.retrieveParentContexts(userQuery);
@@ -1450,13 +1653,16 @@ export class RagService implements OnModuleInit {
         '\n\n(Observacao do sistema: esta resposta pode ter sido interrompida por limite de tamanho e talvez nao cubra todos os itens. Refaca a pergunta de forma mais especifica para obter o restante.)';
     }
 
-    const sourcesMap = new Map<string, { id: string; title: string }>();
-    for (const parent of parents) {
-      const id = parent.metadata.documentId as string;
-      const title = parent.metadata.title as string;
-      if (id && !sourcesMap.has(id)) sourcesMap.set(id, { id, title });
-    }
-    const sources = Array.from(sourcesMap.values());
+    // Fontes navegaveis: um registro por DOCUMENTO (contrato antigo `{ id,
+    // title }` preservado) com os TRECHOS que fundamentaram a resposta e, em
+    // cada trecho, a sua localizacao — quando os dados a sustentam.
+    const sources = buildResponseSources(
+      parents.map((doc) => ({
+        pageContent: doc.pageContent,
+        metadata: doc.metadata as Record<string, unknown>,
+      })),
+      await this.loadSourceDocuments(sourceDocIds),
+    );
 
     const saved = await this.prisma.interactionHistory.create({
       data: {
@@ -1464,8 +1670,28 @@ export class RagService implements OnModuleInit {
         user_query: userQuery,
         ai_response: aiResponse,
         responseSources: {
-          create: sourceDocIds.map((id) => ({
-            normative: { connect: { id } },
+          create: sources.map((source) => ({
+            normative: { connect: { id: source.id } },
+            // A rastreabilidade e persistida junto: reabrir a conversa entrega
+            // as mesmas fontes, trechos e localizacoes da resposta original,
+            // sem depender de recuperar nada de novo.
+            excerpts: {
+              create: source.excerpts.map((excerpt, rank) => ({
+                parent_chunk_id: excerpt.parent_chunk_id,
+                section_header: excerpt.section_header,
+                n1_header: excerpt.n1_header,
+                n2_header: excerpt.n2_header,
+                citation: excerpt.citation,
+                excerpt: excerpt.excerpt,
+                role: excerpt.role,
+                rank,
+                page_start: excerpt.location?.page_start ?? null,
+                page_end: excerpt.location?.page_end ?? null,
+                char_start: excerpt.location?.char_start ?? null,
+                char_end: excerpt.location?.char_end ?? null,
+                location_precision: excerpt.location?.precision ?? null,
+              })),
+            },
           })),
         },
       },
