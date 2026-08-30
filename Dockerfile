@@ -1,19 +1,27 @@
 FROM node:22-slim
 
-RUN apt-get update && apt-get install -y openssl python3 make g++ && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssl python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# pnpm via corepack: a versao vem do campo "packageManager" do package.json
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack enable
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY prisma ./prisma/
 
-RUN npm install --legacy-peer-deps
+# --frozen-lockfile falha se o lockfile estiver dessincronizado do package.json
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
-RUN npx prisma generate
-RUN npm run build
+RUN pnpm exec prisma generate
+RUN pnpm run build
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma migrate deploy && npm run start:prod"]
+CMD ["sh", "-c", "pnpm exec prisma migrate deploy && pnpm run start:prod"]

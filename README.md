@@ -21,6 +21,7 @@ O projeto segue a arquitetura modular do NestJS:
 - **Passport JWT**
 - **Swagger (OpenAPI)**
 - **Docker**
+- **pnpm** (gerenciador de pacotes)
 
 ## Como Rodar
 
@@ -34,11 +35,23 @@ O projeto segue a arquitetura modular do NestJS:
 
 ### Localmente
 
-1. Instale as dependências: `npm install`
+> O projeto usa **pnpm** (versão fixada em `packageManager`). Habilite com `corepack enable`
+> — não use `npm install`, isso recria o `package-lock.json` (que é ignorado pelo git).
+
+1. Instale as dependências: `pnpm install`
 2. Configure o banco no `.env`.
-3. Gere o Prisma: `npx prisma generate`
-4. Rode as migrations: `npx prisma migrate dev`
-5. Inicie: `npm run start:dev`
+3. Gere o Prisma: `pnpm exec prisma generate`
+4. Rode as migrations: `pnpm exec prisma migrate dev`
+5. Inicie: `pnpm start:dev`
+
+### Segurança das dependências
+
+- `pnpm audit` deve reportar **0 vulnerabilidades**.
+- Correções de dependências transitivas ficam em `overrides`, no `pnpm-workspace.yaml`,
+  com o motivo de cada uma comentado.
+- Scripts de instalação (`postinstall`) são bloqueados por padrão; a lista do que pode
+  rodar está em `allowBuilds`, no mesmo arquivo. Ao adicionar um pacote que precise
+  compilar algo, use `pnpm approve-builds`.
 
 ## Fontes navegáveis (RAG)
 
