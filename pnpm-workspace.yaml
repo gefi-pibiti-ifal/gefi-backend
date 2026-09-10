@@ -1,0 +1,27 @@
+# Configuracao do pnpm (pnpm 11+ le as settings deste arquivo).
+# Scripts de instalacao (pre/post-install) sao bloqueados por padrao;
+# apenas os pacotes marcados como `true` podem executa-los.
+# Isso reduz a superficie de ataque de supply chain.
+allowBuilds:
+  '@prisma/client': true # gera o Prisma Client
+  '@prisma/engines': true # baixa os engines do Prisma
+  bcrypt: true # compila o binding nativo
+  prisma: true # CLI do Prisma
+  protobufjs: true # dependencia transitiva do Google GenAI
+  unrs-resolver: true # resolver nativo do ESLint
+  '@nestjs/core': false # apenas mensagem de patrocinio
+  '@scarf/scarf': false # telemetria de instalacao
+  '@google/genai': false # preinstall e um no-op
+  '@parcel/watcher': false # usa os binarios pre-compilados (prebuilds)
+
+# Forca versoes corrigidas de dependencias transitivas com CVE aberto.
+# Todas sao patches dentro da mesma major, sem quebra de API.
+# Revisar periodicamente: quando o pacote-pai atualizar, o override pode sair.
+overrides:
+  ws@<8.21.3: '^8.21.3' # uninitialized memory / DoS por fragmentos
+  qs@<6.15.3: '^6.15.3' # DoS em qs.stringify
+  body-parser@<2.3.0: '^2.3.0' # DoS: limite de tamanho desativado silenciosamente
+  js-yaml@3: '^3.15.2' # DoS quadratico em merge keys / !!omap
+  brace-expansion@2: '^2.1.4' # DoS por expansao exponencial
+  brace-expansion@>=3 <5.0.9: '^5.0.9' # DoS por expansao exponencial
+  '@babel/core@<7.29.1': '^7.29.7' # leitura arbitraria via sourceMappingURL

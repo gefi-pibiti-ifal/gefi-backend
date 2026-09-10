@@ -1,0 +1,47 @@
+# Tudo que nao deve entrar no contexto de build. Alem de deixar a imagem menor,
+# evita que segredos (.env) e artefatos locais (node_modules compilado no
+# Windows) vazem para dentro dela pelo COPY.
+
+# Dependencias e build local
+node_modules
+dist
+build
+coverage
+*.tsbuildinfo
+
+# Segredos e configuracao de ambiente
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Metadados de repositorio e CI
+.git
+.gitignore
+.gitattributes
+.github
+
+# Ferramentas e editores
+.vscode
+.idea
+.eslintcache
+.prettierrc
+eslint.config.mjs
+
+# Testes e documentacao (nao vao para a imagem de producao)
+test
+README.md
+*.md
+GEFI.session.sql
+
+# Docker (nao precisa se copiar para dentro do contexto)
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Logs
+*.log
+logs

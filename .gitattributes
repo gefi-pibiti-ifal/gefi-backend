@@ -1,0 +1,13 @@
+# Normaliza os finais de linha no repositorio (LF), deixando o checkout no
+# Windows a criterio do git.
+* text=auto
+
+# Estes arquivos SEMPRE precisam de LF: com CRLF o shell do container falha com
+# "no such file or directory" ao interpretar o shebang.
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# Lockfile: sem diff no code review e sem merge automatico.
+pnpm-lock.yaml -diff linguist-generated=true

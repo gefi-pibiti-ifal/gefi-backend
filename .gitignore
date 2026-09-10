@@ -1,9 +1,84 @@
-node_modules
-# Keep environment variables out of version control
+# ---- Dependências ----
+node_modules/
+.pnp/
+.pnp.js
+jspm_packages/
+
+# ---- Build / compilação ----
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ---- Testes e cobertura ----
+coverage/
+.nyc_output/
+*.lcov
+
+# ---- Variáveis de ambiente (nunca versionar) ----
 .env
+.env.*
+.env.local
+.env.*.local
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
-/generated/prisma
+# ---- Prisma ----
+/generated/
+prisma/generated/
+prisma/*.db
+prisma/*.db-journal
 
-/generated/prisma
+# ---- Uploads / arquivos gerados em runtime ----
+uploads/
+tmp/
+temp/
+*.pdf.tmp
 
-dist
+# ---- Logs ----
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# ---- Gerenciadores de pacote (o projeto usa pnpm) ----
+package-lock.json
+yarn.lock
+npm-shrinkwrap.json
+.pnpm-store/
+.npm/
+.yarn/cache
+.yarn/install-state.gz
+
+# ---- Caches de ferramentas ----
+.cache/
+.eslintcache
+.prettiercache
+.turbo/
+.swc/
+
+# ---- Editores / IDEs ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+
+# ---- Sistema operacional ----
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

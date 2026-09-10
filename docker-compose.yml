@@ -1,29 +1,142 @@
+# Dois cenarios, a mesma imagem do Dockerfile (estagio "runtime"):
+#   api         -> validacao local, comportamento padrao (sem profile)
+#   api-deploy  -> deploy no servidor, profile "deploy"
+#
+# Uso local (padrao) -- publica em 3000, apenas no loopback:
+#   cp .env.example .env   # e preencha os valores
+#   docker compose up --build
+#   curl http://localhost:3000/api
+#
+# Deploy no servidor (com o .env do ambiente ja preenchido) -- publica em 2999,
+# deixando a 3000 livre para uso local no mesmo host:
+#   docker compose --profile deploy up -d --build api-deploy
+#   docker compose --profile deploy logs -f api-deploy
+#   docker compose --profile deploy down
+#
+# Nomear api-deploy nos comandos acima eh obrigatorio: um "up" sem nome de
+# servico sobe tambem o api (que nao tem profile) em silencio, deixando dois
+# containers no host.
+#
+# O Postgres nunca e publicado para fora: escuta so em 127.0.0.1 e a API o
+# alcanca pela rede interna do compose.
+
+# Endurecimento comum aos dois containers da API.
+x-api-hardening: &api-hardening
+  read_only: true # a aplicacao nao escreve em disco
+  tmpfs:
+    - /tmp # unico ponto gravavel (HOME=/tmp na imagem)
+  security_opt:
+    - no-new-privileges:true # bloqueia escalada via binarios setuid
+  cap_drop:
+    - ALL # a API roda como usuario `node` na porta 3000, nao precisa de nenhuma
+  init: true # reaper de PID 1, garante o encerramento dos processos filhos
+  pids_limit: 256 # contem fork bomb em caso de RCE
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
-    image: ankane/pgvector
-    container_name: postgres-vector
+    # Imagem oficial do pgvector, com major fixada. O ankane/pgvector foi
+    # descontinuado em favor desta. ATENCAO: trocar o `pg16` por outra major
+    # exige dump/restore -- o Postgres nao le um data dir de outra versao.
+    image: pgvector/pgvector:pg16
+    container_name: gefi-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: gefi
+      POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER no .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+      POSTGRES_DB: ${POSTGRES_DB:?defina POSTGRES_DB no .env}
+      # scram-sha-256 explicito: nao depende do default da imagem.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
     ports:
-      - "5432:5432"
+      # Somente loopback do host, para clientes SQL locais. Nunca 0.0.0.0.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
 
- # api:
-  #  build: .
-  #  container_name: gefi-api
-  #  restart: always
-  #  ports:
-  #    - "3000:3000"
-  #  environment:
-  #    - PORT=3000
-  #    - DATABASE_URL=postgresql://gefi:gefi_pass@db:5432/gefi_db?schema=public
-  #    - JWT_SECRET=gefi_secret_key_2026
-  #    - OPENAI_API_KEY=\${OPENAI_API_KEY}
-  #  depends_on:
-  #    - db
+  api:
+    build:
+      context: .
+      target: runtime
+    image: gefi-api:local
+    container_name: gefi-api
+    env_file:
+      - .env
+    environment:
+      # Sobrepoe o DATABASE_URL do .env: dentro da rede do compose o banco
+      # responde pelo nome do servico, nao por localhost.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      NODE_ENV: ${NODE_ENV:-production}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+    ports:
+      # Loopback: em uso local nao ha motivo para expor na rede.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Sem curl/wget na imagem runtime: o proprio node faz o probe.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:3000/api',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+    <<: *api-hardening
+
+  api-deploy:
+    profiles: ["deploy"]
+    build:
+      context: .
+      target: runtime
+    image: gefi-api:deploy
+    container_name: gefi-api-deploy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      NODE_ENV: production
+      # Com mais de uma replica, mude para false: duas instancias aplicando
+      # migrations ao mesmo tempo disputam o lock do Prisma.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+    ports:
+      # Publicado na rede. O ideal e manter "127.0.0.1:2999:3000" e colocar um
+      # reverse proxy com TLS na frente (nginx/Caddy/Traefik) -- a aplicacao
+      # fala HTTP puro e nao deve receber trafego da internet diretamente.
+      - "${API_BIND:-0.0.0.0}:2999:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:3000/api',r=>process.exit(r.statusCode<400?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging: *logging
+    <<: *api-hardening
 
 volumes:
   postgres_data:
