@@ -1,65 +1,75 @@
-import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
-import { JwtService } from '@nestjs/jwt';
-import { UsersService } from '../users/users.service';
-import * as bcrypt from 'bcrypt';
+import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
+import { PublicUser, UsersService } from '../users/users.service';
+import { GoogleService } from './google.service';
+import { TokenService } from './token.service';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
-    private usersService: UsersService,
-    private jwtService: JwtService,
+    private readonly usersService: UsersService,
+    private readonly googleService: GoogleService,
+    private readonly tokenService: TokenService,
   ) {}
 
-  async register(userData: any) { 
-    const existingUser = await this.usersService.findOneByEmail(userData.email);
-    if (existingUser) {
-      throw new BadRequestException('E-mail já cadastrado');
+  /**
+   * Unico ponto de entrada de sessao do sistema.
+   *
+   * A inversao em relacao ao fluxo antigo esta no passo 3: nao existe mais
+   * auto-cadastro. O Google prova QUEM a pessoa e; quem decide SE ela entra (e
+   * com que cargo) e a linha que um administrador criou antes. Uma conta
+   * institucional valida sem convite e recusada.
+   */
+  async loginWithGoogle(
+    credential: string,
+  ): Promise<{ user: PublicUser; token: string }> {
+    const identidade = await this.googleService.verificarCredential(credential);
+
+    // Busca primeiro pelo `sub` porque ele sobrevive a troca de e-mail no
+    // Workspace; o e-mail e o caminho do PRIMEIRO acesso, quando ainda nao ha
+    // vinculo nenhum.
+    let user =
+      (await this.usersService.findByGoogleSub(identidade.sub)) ??
+      (await this.usersService.findOneByEmail(identidade.email));
+
+    if (!user) {
+      this.logger.warn(
+        `Login recusado: ${identidade.email} nao esta pre-cadastrado.`,
+      );
+      throw new ForbiddenException(
+        'Seu e-mail nao esta autorizado a acessar o GeFi. Procure um administrador do sistema.',
+      );
     }
 
-    const password_hash = await bcrypt.hash(userData.password, 10);
-    
-    const { password, user_type, ...rest } = userData;
-    const formattedUserType = user_type?.toUpperCase(); 
+    if (user.revoked_at) {
+      this.logger.warn(
+        `Login recusado: ${identidade.email} teve o acesso revogado.`,
+      );
+      throw new ForbiddenException(
+        'Seu acesso ao GeFi foi revogado. Procure um administrador.',
+      );
+    }
 
-    const user = await this.usersService.create({
-      ...rest,
-      user_type: formattedUserType,
-      password_hash,
+    // Conta Google diferente reivindicando um e-mail ja vinculado. Nao deveria
+    // acontecer com Workspace, mas recusar e mais barato que investigar depois.
+    if (user.google_sub && user.google_sub !== identidade.sub) {
+      this.logger.error(
+        `Conflito de identidade em ${identidade.email}: google_sub divergente do vinculado.`,
+      );
+      throw new ForbiddenException(
+        'Este e-mail ja esta vinculado a outra conta Google. Procure um administrador.',
+      );
+    }
+
+    user = await this.usersService.registrarLogin(user.id, {
+      googleSub: identidade.sub,
+      pictureUrl: identidade.picture,
     });
 
-    const payload = { id: user.id, email: user.email, user_type: user.user_type };
-    
     return {
-      token: this.jwtService.sign(payload),
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        user_type: user.user_type,
-      },
-    };
-  }
-
-  async login(email: string, pass: string) {
-    const user = await this.usersService.findOneByEmail(email);
-    if (!user) {
-      throw new UnauthorizedException('Credenciais inválidas');
-    }
-
-    const isMatch = await bcrypt.compare(pass, user.password_hash);
-    if (!isMatch) {
-      throw new UnauthorizedException('Credenciais inválidas');
-    }
-
-    const payload = { id: user.id, email: user.email, user_type: user.user_type };
-    return {
-      token: this.jwtService.sign(payload),
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        user_type: user.user_type,
-      },
+      user: this.usersService.toPublic(user),
+      token: this.tokenService.assinar(user),
     };
   }
 }

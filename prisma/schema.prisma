@@ -17,15 +17,46 @@ enum UserType {
   FISCAL
 }
 
+/// A identidade e provada pelo Google; este model guarda APENAS a autorizacao
+/// (quem pode entrar e com que cargo) e os dados institucionais que o Google
+/// nao tem. Nao ha senha: uma linha aqui sem `google_sub` e um convite
+/// pendente, criado por um administrador antes do primeiro acesso da pessoa.
 model User {
-  id                String   @id @default(uuid())
-  full_name         String
-  email             String   @unique
-  password_hash     String
+  id String @id @default(uuid())
+
+  /// Sempre em minusculas. E a chave do convite: o login casa o e-mail
+  /// verificado pelo Google com a linha pre-cadastrada.
+  email String @unique
+
+  /// Nulos ate o primeiro login: o administrador convida sabendo so o e-mail
+  /// e o cargo, e a propria pessoa completa o resto em /complete-profile.
+  full_name         String?
   siap_registration String?
-  user_type         UserType @default(FISCAL)
-  created_at        DateTime @default(now())
-  updated_at        DateTime @updatedAt
+  profile_completed Boolean @default(false)
+
+  /// `sub` do ID token do Google. E o identificador ESTAVEL da conta -- o
+  /// e-mail pode ser renomeado pelo Workspace, o `sub` nao. Nulo enquanto o
+  /// convite nao foi usado; unico para impedir que duas linhas reivindiquem
+  /// a mesma conta Google.
+  google_sub  String? @unique
+  picture_url String?
+
+  /// O cargo NUNCA vem do cliente: e definido no convite e so muda por rota
+  /// de administrador (ver users.controller.ts).
+  user_type UserType @default(FISCAL)
+
+  /// Revogacao em vez de exclusao. Um fiscal que ja subiu normativos ou abriu
+  /// conversas nao pode ser apagado sem destruir a rastreabilidade -- que e o
+  /// proposito do sistema. Preenchido => o login e recusado.
+  revoked_at DateTime?
+
+  invited_by_id String?
+  last_login_at DateTime?
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  invited_by User?  @relation("UserInvites", fields: [invited_by_id], references: [id], onDelete: SetNull)
+  invitees   User[] @relation("UserInvites")
 
   conversations      Conversation[]
   normativeDocuments NormativeDocument[]
