@@ -62,6 +62,18 @@ export class AuthService {
       );
     }
 
+    // Registrado no primeiro vinculo porque e a unica forma pratica de
+    // descobrir qual `hd` as contas da instituicao realmente trazem -- um
+    // Workspace com dominio secundario (ex.: aluno.ifal.edu.br) devolve o
+    // secundario, nao o primario. Sem saber o valor real, preencher
+    // GOOGLE_ALLOWED_HD e chute, e um chute errado tranca todo mundo do lado
+    // de fora.
+    if (!user.google_sub) {
+      this.logger.log(
+        `Primeiro acesso de ${identidade.email} (hd=${identidade.hd ?? 'sem dominio'}).`,
+      );
+    }
+
     user = await this.usersService.registrarLogin(user.id, {
       googleSub: identidade.sub,
       pictureUrl: identidade.picture,
