@@ -2,6 +2,11 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { readPageMap } from '../rag/document-location';
 import { buildDocumentLinks } from '../rag/response-sources';
+import { decodeUploadFileName } from '../common/file-name';
+
+// O Content-Disposition e montado em common/file-name; re-exportado aqui
+// porque e a partir deste servico que a rota de arquivo o utiliza.
+export { buildContentDisposition } from '../common/file-name';
 
 // Campos seguros para respostas de API: TUDO menos file_data, que e o PDF
 // inteiro e so trafega pela rota de arquivo. Selecionar explicitamente evita
@@ -19,21 +24,11 @@ const DOCUMENT_SUMMARY_SELECT = {
   total_pages: true,
 } as const;
 
-/**
- * Monta o cabecalho Content-Disposition de forma segura.
- *
- * O nome do arquivo vem do upload (portanto do usuario): CR/LF e aspas sao
- * removidos para que ele nao possa injetar cabecalhos, e a forma `filename*`
- * (RFC 5987) preserva acentos — comuns em titulos de normas — sem depender do
- * que o cliente aceita em bytes crus.
- */
-export function buildContentDisposition(
-  type: 'inline' | 'attachment',
-  fileName: string,
-): string {
-  const sanitized = fileName.replace(/[\r\n"\\]/g, '').trim() || 'documento.pdf';
-  const ascii = sanitized.replace(/[^\x20-\x7E]/g, '_');
-  return `${type}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(sanitized)}`;
+// Documentos enviados antes da correcao do encoding tem o nome gravado como o
+// multipart o entregou (UTF-8 lido como latin1). A reparacao na LEITURA faz
+// esses arquivos ja sairem com o nome certo, sem exigir reenvio.
+function fileNameOf(fileName: string | null): string | null {
+  return fileName ? decodeUploadFileName(fileName) : fileName;
 }
 
 @Injectable()
@@ -75,7 +70,10 @@ export class DocumentsService {
     ]);
 
     return {
-      data,
+      data: data.map((document) => ({
+        ...document,
+        file_name: fileNameOf(document.file_name),
+      })),
       meta: {
         total,
         page,
@@ -98,9 +96,10 @@ export class DocumentsService {
 
     return {
       ...document,
+      file_name: fileNameOf(document.file_name),
       file: {
         available: Boolean(document.file_name),
-        name: document.file_name,
+        name: fileNameOf(document.file_name),
         mime_type: document.file_mime_type,
         size: document.file_size,
       },
@@ -139,7 +138,7 @@ export class DocumentsService {
 
     return {
       data: Buffer.from(document.file_data),
-      fileName: document.file_name ?? `${document.title}.pdf`,
+      fileName: fileNameOf(document.file_name) ?? `${document.title}.pdf`,
       mimeType: document.file_mime_type ?? 'application/pdf',
     };
   }

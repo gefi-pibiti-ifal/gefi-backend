@@ -19,21 +19,30 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiBody, ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { createHash } from 'crypto';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { JwtService } from '@nestjs/jwt';
 import { DocumentsService, buildContentDisposition } from './documents.service';
+import { decodeUploadFileName } from '../common/file-name';
 import { RagService } from '../rag/rag.service';
 import type { PageInput } from '../rag/document-location';
+import {
+  DocumentAccessGuard,
+  DOCUMENT_ACCESS_SCOPE,
+  DOCUMENT_ACCESS_TTL_SECONDS,
+} from './document-access.guard';
 
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 
 @ApiTags('Documentos')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+// DocumentAccessGuard = JwtAuthGuard + aceite de token de leitura na query
+// string (necessario para <iframe>/<embed>/pdf.js, que nao enviam cabecalho).
+@UseGuards(DocumentAccessGuard)
 @Controller('documents')
 export class DocumentsController {
   constructor(
     private documentsService: DocumentsService,
     private ragService: RagService,
+    private jwtService: JwtService,
   ) {}
 
   @Post('upload')
@@ -131,7 +140,10 @@ export class DocumentsController {
       document_type: body.document_type,
       original_content: content,
       admin_id: req.user.id,
-      file_name: file.originalname,
+      // O multipart entrega o nome lido como latin1: sem esta reparacao,
+      // "INSTRUÇÃO.pdf" e gravado como "INSTRUÃ‡ÃƒO.pdf" e desce no download
+      // com os acentos trocados.
+      file_name: decodeUploadFileName(file.originalname),
       file_mime_type: file.mimetype,
       file_size: file.size,
       file_hash: createHash('sha256').update(file.buffer).digest('hex'),
@@ -212,6 +224,34 @@ export class DocumentsController {
     return this.documentsService.getContent(id);
   }
 
+  @Post(':id/access-token')
+  @ApiOperation({
+    summary:
+      'Emite um token curto para abrir o arquivo em visualizador (iframe/embed/pdf.js)',
+  })
+  async issueAccessToken(@Param('id') id: string, @Req() req: any) {
+    // Confirma que o documento existe e e visivel antes de emitir credencial.
+    const document = await this.documentsService.findOne(id);
+
+    const token = await this.jwtService.signAsync(
+      { sub: req.user.id, doc: id, scope: DOCUMENT_ACCESS_SCOPE },
+      { expiresIn: DOCUMENT_ACCESS_TTL_SECONDS },
+    );
+    const query = `token=${encodeURIComponent(token)}`;
+
+    return {
+      token,
+      expires_in: DOCUMENT_ACCESS_TTL_SECONDS,
+      // URLs prontas para <iframe src>, <embed> ou window.open — nenhuma delas
+      // consegue enviar o cabecalho Authorization.
+      view_url: document.view_url ? `${document.view_url}?${query}` : null,
+      download_url: document.download_url
+        ? `${document.download_url}&${query}`
+        : null,
+      content_url: `${document.content_url}?${query}`,
+    };
+  }
+
   @Post(':id/locations/backfill')
   @ApiOperation({
     summary:
@@ -227,7 +267,6 @@ export class DocumentsController {
   }
 
   @Delete(':id')
-  @UseGuards(JwtAuthGuard)
   async remove(@Param('id') id: string, @Req() req: any) {
     if (req.user.user_type !== 'ADMINISTRADOR') {
       throw new ForbiddenException('Apenas administradores podem deletar documentos');

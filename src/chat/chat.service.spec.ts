@@ -55,6 +55,7 @@ function buildPrismaMock() {
       update: jest.fn(async (args: any) => args),
     },
     interactionHistory: { findMany: jest.fn(async () => [INTERACTION]) },
+    user: { findUnique: jest.fn(async () => ({ response_persona: 'CORDIAL' })) },
   };
 }
 
@@ -155,6 +156,48 @@ describe('ChatService', () => {
       expect(include.responseSources.include.excerpts).toEqual({
         orderBy: { rank: 'asc' },
       });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Personalidade da conversa
+  // -------------------------------------------------------------------------
+  describe('personalidade', () => {
+    test('conversa nasce sem personalidade fixada por padrao', async () => {
+      await service.createConversation('Consulta', 'user-1');
+
+      const [args] = prisma.conversation.create.mock.calls[0] as any[];
+      expect(args.data.persona).toBeNull();
+    });
+
+    test('conversa pode nascer com personalidade fixada', async () => {
+      await service.createConversation('Consulta', 'user-1', 'cordial');
+
+      const [args] = prisma.conversation.create.mock.calls[0] as any[];
+      expect(args.data.persona).toBe('CORDIAL');
+    });
+
+    test('personalidade invalida na criacao nao fixa nada (segue o usuario)', async () => {
+      await service.createConversation('Consulta', 'user-1', 'ENGRACADO');
+
+      const [args] = prisma.conversation.create.mock.calls[0] as any[];
+      expect(args.data.persona).toBeNull();
+    });
+
+    test('null solta a conversa de volta para a preferencia do usuario', async () => {
+      await service.setConversationPersona('conv-1', null);
+
+      const [args] = prisma.conversation.update.mock.calls[0] as any[];
+      expect(args.data.persona).toBeNull();
+    });
+
+    test('le a preferencia do usuario', async () => {
+      expect(await service.getUserPersonaPreference('user-1')).toBe('CORDIAL');
+    });
+
+    test('usuario sem preferencia devolve null (a resolucao decide o padrao)', async () => {
+      prisma.user.findUnique.mockResolvedValueOnce({ response_persona: null } as any);
+      expect(await service.getUserPersonaPreference('user-1')).toBeNull();
     });
   });
 

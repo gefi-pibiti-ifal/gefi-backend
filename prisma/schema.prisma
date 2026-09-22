@@ -24,6 +24,10 @@ model User {
   password_hash     String
   siap_registration String?
   user_type         UserType @default(FISCAL)
+  // Personalidade preferida nas respostas do RAG (ver rag/response-persona.ts).
+  // String, e nao enum, de proposito: acrescentar uma personalidade e uma
+  // mudanca de codigo, nao de banco, e um valor desconhecido cai no padrao.
+  response_persona  String?
   created_at        DateTime @default(now())
   updated_at        DateTime @updatedAt
 
@@ -42,6 +46,8 @@ model Conversation {
   updated_at DateTime  @updatedAt
   is_pinned  Boolean   @default(false)
   deleted_at DateTime?
+  // Personalidade fixada para esta conversa; nulo = usa a preferencia do usuario.
+  persona    String?
 
   user               User                  @relation(fields: [user_id], references: [id])
   interactionHistory InteractionHistory[]
@@ -55,6 +61,8 @@ model InteractionHistory {
   conversation_id String
   user_query      String
   ai_response     String
+  // Personalidade que de fato gerou esta resposta (auditoria do historico).
+  persona         String?
   created_at      DateTime @default(now())
 
   conversation    Conversation     @relation(fields: [conversation_id], references: [id])

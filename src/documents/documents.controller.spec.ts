@@ -1,8 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ForbiddenException, StreamableFile } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { DocumentsController } from './documents.controller';
 import { DocumentsService } from './documents.service';
 import { RagService } from '../rag/rag.service';
+import { DOCUMENT_ACCESS_SCOPE } from './document-access.guard';
 
 // O PDFLoader real carrega o pdf-parse por import dinamico de um caminho de
 // arquivo — o que nao resolve sob o ts-jest (CommonJS), embora funcione em
@@ -64,12 +66,18 @@ describe('DocumentsController', () => {
     remove: jest.Mock;
   };
   let ragService: { indexDocument: jest.Mock; backfillDocumentLocations: jest.Mock };
+  let jwtService: { signAsync: jest.Mock };
 
   beforeEach(async () => {
     documentsService = {
       create: jest.fn(async (data: any) => ({ id: 'doc-1', ...data })),
       findAll: jest.fn(async () => ({ data: [], meta: {} })),
-      findOne: jest.fn(async () => ({ id: 'doc-1' })),
+      findOne: jest.fn(async () => ({
+        id: 'doc-1',
+        view_url: '/api/documents/doc-1/file',
+        download_url: '/api/documents/doc-1/file?download=1',
+        content_url: '/api/documents/doc-1/content',
+      })),
       getFile: jest.fn(async () => ({
         data: Buffer.from('%PDF-1.7'),
         fileName: 'in-05-2017.pdf',
@@ -78,6 +86,7 @@ describe('DocumentsController', () => {
       getContent: jest.fn(async () => ({ id: 'doc-1', content: 'texto' })),
       remove: jest.fn(async () => ({ id: 'doc-1' })),
     };
+    jwtService = { signAsync: jest.fn(async () => 'token-de-acesso') };
     ragService = {
       indexDocument: jest.fn(async () => undefined),
       backfillDocumentLocations: jest.fn(async () => ({
@@ -92,6 +101,7 @@ describe('DocumentsController', () => {
       providers: [
         { provide: DocumentsService, useValue: documentsService },
         { provide: RagService, useValue: ragService },
+        { provide: JwtService, useValue: jwtService },
       ],
     }).compile();
 
@@ -156,6 +166,25 @@ describe('DocumentsController', () => {
       expect(documentsService.create.mock.calls[0][0].total_pages).toBe(3);
     });
 
+    test('nome acentuado corrompido pelo multipart e gravado ja reparado', async () => {
+      const file = buildFile();
+      // Como o busboy entrega: UTF-8 lido como latin1.
+      (file as any).originalname = Buffer.from(
+        'INSTRUÇÃO NORMATIVA Nº 5.pdf',
+        'utf8',
+      ).toString('latin1');
+
+      await controller.upload(
+        file,
+        { title: 'IN 05/2017', document_type: 'IN' },
+        { user: ADMIN },
+      );
+
+      expect(documentsService.create.mock.calls[0][0].file_name).toBe(
+        'INSTRUÇÃO NORMATIVA Nº 5.pdf',
+      );
+    });
+
     test('somente administradores enviam documentos', async () => {
       await expect(
         controller.upload(
@@ -208,6 +237,22 @@ describe('DocumentsController', () => {
       );
     });
 
+    test('o nome acentuado desce sem virar sublinhado', async () => {
+      documentsService.getFile.mockResolvedValueOnce({
+        data: Buffer.from('%PDF-1.7'),
+        fileName: 'INSTRUÇÃO NORMATIVA Nº 5.pdf',
+        mimeType: 'application/pdf',
+      });
+      const res = buildResponse();
+
+      await controller.getFile('doc-1', res, '1');
+
+      const disposition = res.set.mock.calls[0][0]['Content-Disposition'];
+      expect(disposition).toContain('filename="INSTRUCAO NORMATIVA No 5.pdf"');
+      expect(disposition).toContain("filename*=UTF-8''INSTRU%C3%87%C3%83O");
+      expect(disposition).not.toContain('_');
+    });
+
     test('download=0 e download=false continuam sendo visualizacao', async () => {
       const zero = buildResponse();
       await controller.getFile('doc-1', zero, '0');
@@ -228,6 +273,58 @@ describe('DocumentsController', () => {
     test('texto indexado', async () => {
       await controller.getContent('doc-1');
       expect(documentsService.getContent).toHaveBeenCalledWith('doc-1');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Token de leitura — o que permite <iframe>/<embed>/pdf.js abrirem o arquivo
+  // -------------------------------------------------------------------------
+  describe('issueAccessToken', () => {
+    test('emite token curto, restrito ao documento e ao usuario', async () => {
+      await controller.issueAccessToken('doc-1', { user: ADMIN });
+
+      const [payload, options] = jwtService.signAsync.mock.calls[0];
+      expect(payload).toEqual({
+        sub: 'user-admin',
+        doc: 'doc-1',
+        scope: DOCUMENT_ACCESS_SCOPE,
+      });
+      expect(options.expiresIn).toBeLessThanOrEqual(900);
+    });
+
+    test('devolve URLs prontas para o visualizador', async () => {
+      const result = await controller.issueAccessToken('doc-1', { user: ADMIN });
+
+      expect(result.view_url).toBe(
+        '/api/documents/doc-1/file?token=token-de-acesso',
+      );
+      expect(result.download_url).toBe(
+        '/api/documents/doc-1/file?download=1&token=token-de-acesso',
+      );
+      expect(result.content_url).toBe(
+        '/api/documents/doc-1/content?token=token-de-acesso',
+      );
+      expect(result.expires_in).toBeGreaterThan(0);
+    });
+
+    test('documento sem arquivo original nao ganha URL de arquivo', async () => {
+      documentsService.findOne.mockResolvedValueOnce({
+        id: 'doc-legacy',
+        view_url: null,
+        download_url: null,
+        content_url: '/api/documents/doc-legacy/content',
+      });
+
+      const result = await controller.issueAccessToken('doc-legacy', { user: ADMIN });
+
+      expect(result.view_url).toBeNull();
+      expect(result.download_url).toBeNull();
+      expect(result.content_url).toContain('token=');
+    });
+
+    test('fiscal tambem pode abrir a fonte que fundamentou a resposta', async () => {
+      const result = await controller.issueAccessToken('doc-1', { user: FISCAL });
+      expect(result.token).toBe('token-de-acesso');
     });
   });
 

@@ -20,6 +20,7 @@
 // ---------------------------------------------------------------------------
 
 import { buildCitation } from './source-citation';
+import { decodeUploadFileName } from '../common/file-name';
 
 /** Prefixo das rotas de documento (o app usa setGlobalPrefix('api')). */
 export const DOCUMENTS_API_PREFIX = '/api/documents';
@@ -110,7 +111,9 @@ function toFile(info: SourceDocumentInfo | undefined): SourceDocumentFile {
   const available = Boolean(info?.file_name);
   return {
     available,
-    name: info?.file_name ?? null,
+    // Nomes gravados antes da correcao do encoding do multipart sao reparados
+    // na leitura — a fonte mostra o nome real do arquivo.
+    name: info?.file_name ? decodeUploadFileName(info.file_name) : null,
     mime_type: info?.file_mime_type ?? null,
     size: info?.file_size ?? null,
   };

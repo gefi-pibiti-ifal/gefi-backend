@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { buildHistorySources } from '../rag/response-sources';
+import { isKnownPersona, resolvePersona } from '../rag/response-persona';
 
 // Campos do documento necessarios para montar uma fonte navegavel a partir do
 // historico. Nunca inclui file_data (o PDF inteiro) nem os textos completos.
@@ -18,10 +19,41 @@ const HISTORY_NORMATIVE_SELECT = {
 export class ChatService {
   constructor(private prisma: PrismaService) {}
 
-  async createConversation(title: string, user_id: string) {
+  async createConversation(title: string, user_id: string, persona?: unknown) {
     return this.prisma.conversation.create({
-      data: { title, user_id },
+      // Personalidade nula = a conversa segue a preferencia do usuario. Fixar
+      // aqui so faz sentido quando ele escolheu um tom para ESTA consulta.
+      data: {
+        title,
+        user_id,
+        persona: isKnownPersona(persona) ? resolvePersona(persona).id : null,
+      },
     });
+  }
+
+  /**
+   * Fixa (ou solta) a personalidade de uma conversa. `null` devolve a conversa
+   * ao padrao do usuario — nao ha estado intermediario.
+   */
+  async setConversationPersona(id: string, persona: unknown) {
+    return this.prisma.conversation.update({
+      where: { id },
+      data: { persona: isKnownPersona(persona) ? resolvePersona(persona).id : null },
+      select: { id: true, title: true, persona: true },
+    });
+  }
+
+  /**
+   * Preferencia de personalidade do usuario. Fica aqui (e nao no UsersService)
+   * para o ChatModule nao precisar depender do UsersModule so por causa de uma
+   * coluna; a regra de precedencia vive em response-persona.ts.
+   */
+  async getUserPersonaPreference(user_id: string): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: user_id },
+      select: { response_persona: true },
+    });
+    return user?.response_persona ?? null;
   }
 
   async validateConversation(id: string, user_id: string) {
@@ -57,6 +89,7 @@ export class ChatService {
           title: true,
           created_at: true,
           is_pinned: true, // Adicionado para o frontend saber o estado
+          persona: true, // nulo = segue a preferencia do usuario
         },
       }),
       this.prisma.conversation.count({ where: whereClause })

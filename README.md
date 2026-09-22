@@ -138,9 +138,71 @@ Toda resposta do RAG devolve `sources`: uma entrada por **documento** citado, co
 | `GET /api/documents/:id` | Metadados da fonte + links |
 | `GET /api/documents/:id/file` | Arquivo original (inline); `?download=1` força download |
 | `GET /api/documents/:id/content` | Texto indexado + `page_map` (coordenadas das fontes) |
+| `POST /api/documents/:id/access-token` | Token curto (10 min) para abrir o arquivo em `<iframe>`/`<embed>`/pdf.js |
 | `POST /api/documents/:id/locations/backfill` | Admin: recalcula coordenadas de documento já indexado (não refaz embeddings) |
 
+### Abrindo o documento no frontend
+
+`view_url` e `download_url` exigem `Authorization: Bearer` — e `<iframe src>`, `<embed>`, `<object>` e o pdf.js **não enviam cabeçalhos**. Por isso o visualizador ficava em branco. Duas formas de resolver:
+
+```js
+// 1. Token na URL (funciona direto em iframe/embed/nova aba)
+const { view_url, download_url } = await api.post(`/documents/${id}/access-token`);
+iframe.src = `${API_BASE}${view_url}#page=${excerpt.location.page_start}`;
+
+// 2. Blob (quando a página já busca com o token de sessão)
+const res  = await fetch(`${API_BASE}${source.view_url}`, { headers: { Authorization: `Bearer ${jwt}` } });
+const name = res.headers.get('Content-Disposition');  // legível: exposto via CORS
+iframe.src = URL.createObjectURL(await res.blob());
+```
+
+O token de acesso vale 10 minutos, serve **só para leitura** e **só para aquele documento** — não autentica sessão nem autoriza exclusão.
+
 Documentos enviados **antes** desta funcionalidade não têm arquivo original (`file.available: false`) nem páginas. O backfill recupera os offsets de caractere; páginas e localização por trecho exigem reenviar o PDF.
+
+## Personalidade das respostas
+
+O GeFi responde em dois registros. A personalidade muda **como** a resposta é escrita — nunca **o que** ela diz: estrutura, seleção de dispositivos, cobertura, fidelidade e citação da fonte são idênticas nas duas (há teste travando essa invariante).
+
+| id | tom |
+| --- | --- |
+| `INSTITUCIONAL` (padrão) | Impessoal, como um órgão respondendo a uma consulta interna. Não se dirige ao leitor. |
+| `CORDIAL` | Formal no conteúdo, próximo no tom. Pode usar "você" com moderação e explicar o porquê — **só quando os trechos o sustentam**. |
+
+Em ambas continuam proibidos: opinião, recomendação fora da norma, saudação, emoji e qualquer afirmação que os trechos não sustentem.
+
+**Abertura interativa.** A resposta começa por uma *linha de entrada* — uma frase que situa quem perguntou antes de receber a regra — e só então dá a resposta (que aparece no máximo na segunda frase). A linha só sobrevive se passar em três testes: contém um fato concreto dos trechos, faz falta quando apagada, e não serviria para qualquer pergunta do mesmo assunto. O erro que ela mais atrai é a *frase de tema* ("o cabimento depende do enquadramento do objeto"), nomeada no prompt como o que **não** fazer.
+
+- INSTITUCIONAL: sóbria e factual — *"O teto muda conforme o objeto: obra e engenharia têm um valor, compras e serviços têm outro."*
+- CORDIAL: fala com o leitor — *"Depende do que você vai contratar: obra e engenharia têm um teto, compra e serviço comum têm outro."*
+
+**Perguntas de procedimento** (as mais comuns do fiscal) seguem o modo 5B, com um bloco por dispositivo. Para a resposta ser um roteiro de trabalho e não o índice da norma: a abertura diz em quantos momentos a rotina se divide; o título do bloco pode nomear **o momento** (*"Ao fechar o mês"*) quando o próprio dispositivo declara esse momento; e a frase de cada bloco é uma **tradução** do que a pessoa faz ali, não um recorte da norma. As garantias de cobertura seguem intactas — um dispositivo por bloco, nada fundido, nada omitido.
+
+Sem eval automatizado, mudanças de prompt só se julgam lendo a saída. Para comparar a mesma pergunta nas duas personalidades contra o modelo real:
+
+```bash
+PORT=3999 node dist/main.js &
+node scripts/comparar-personas.js "sua pergunta aqui"
+```
+
+**Escolha em três níveis**, do mais específico para o mais geral:
+
+1. `persona` no corpo de `POST /api/chat/ask` — vale só para aquela resposta;
+2. `Conversation.persona` — fixa o tom de uma consulta inteira;
+3. `User.response_persona` — a preferência do usuário;
+4. padrão do sistema (`INSTITUCIONAL`).
+
+Um valor desconhecido (cliente desatualizado) cai no padrão em vez de falhar; na **escrita** da preferência, porém, é recusado com 400 — gravar outra coisa em silêncio seria mentir para o usuário.
+
+| Rota | Descrição |
+| --- | --- |
+| `GET /api/chat/personas` | Catálogo do seletor: `id`, `label`, `description`, `sample`, `is_default` |
+| `GET /api/users/me` | Perfil + `response_persona` + `available_personas` |
+| `PATCH /api/users/me/preferences` | `{ "response_persona": "CORDIAL" }` |
+| `POST /api/chat/conversations` | aceita `persona` opcional |
+| `PATCH /api/chat/conversations/:id/persona` | `{ "persona": "CORDIAL" }` — `null` volta à preferência do usuário |
+
+`POST /api/chat/ask` devolve `persona` com a personalidade que **de fato** gerou a resposta, e cada interação do histórico guarda a sua — trocar de preferência não reescreve o passado.
 
 ## Documentação
 

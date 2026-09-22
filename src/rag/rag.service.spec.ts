@@ -755,11 +755,72 @@ describe('buildRagPrompt', () => {
       expect(prompt).toContain('Ter duas partes nao transforma a pergunta em (d)');
     });
 
-    test('exige resposta na primeira linha, sem preambulo sobre a norma', () => {
-      expect(prompt).toContain('a primeira frase contem a RESPOSTA');
+    test('exige a resposta na abertura, sem preambulo sobre a norma', () => {
+      expect(prompt).toContain('a resposta vem na ABERTURA — no maximo na segunda frase');
       // aberturas que descrevem a norma em vez de responder ficam proibidas
       expect(prompt).toContain('A legislacao permite...');
       expect(prompt).toContain('A norma estabelece as diretrizes...');
+    });
+
+    // -----------------------------------------------------------------------
+    // Linha de entrada: a abertura interativa que situa quem perguntou.
+    // O risco que ela reabre e o que as regras de abertura corrigiram um dia —
+    // a resposta ficar soterrada. Por isso vem com teto e com teste proprio.
+    // -----------------------------------------------------------------------
+    test('a abertura tem entrada e resposta, nessa ordem', () => {
+      const entrada = prompt.indexOf('a) LINHA DE ENTRADA');
+      const resposta = prompt.indexOf('b) A RESPOSTA');
+      expect(entrada).toBeGreaterThan(-1);
+      expect(entrada).toBeLessThan(resposta);
+      // a resposta continua tipada
+      expect(prompt).toContain('A PRIMEIRA PALAVRA ja pertence ao tipo de resposta pedido');
+    });
+
+    test('a linha de entrada tem teto: uma frase e a resposta ate a segunda', () => {
+      expect(prompt).toContain('UMA frase que situa quem perguntou');
+      expect(prompt).toContain('E uma frase — nunca duas, nunca um paragrafo');
+      expect(prompt).toContain('no maximo na segunda frase do texto');
+    });
+
+    test('a linha de entrada tem testes de descarte explicitos', () => {
+      expect(prompt).toContain('TRES TESTES, aplicados sempre');
+      // o criterio mecanico que separa orientacao de frase de tema
+      expect(prompt).toContain('CONTEM UM FATO CONCRETO dos trechos');
+      expect(prompt).toContain('A resposta perdeu alguma coisa? Se nao perdeu, era enchimento');
+      expect(prompt).toContain('ELA SERVIRIA PARA QUALQUER PERGUNTA');
+      expect(prompt).toContain('Na duvida, nao escreva');
+    });
+
+    test('a frase de tema e nomeada como o erro mais comum, com exemplos', () => {
+      // Foi o que o modelo de fato produziu nas primeiras execucoes: o tema da
+      // pergunta repetido em linguagem normativa, sem informar nada.
+      expect(prompt).toContain('o mais dificil de enxergar, e a FRASE DE TEMA');
+      expect(prompt).toContain('ERRADO (frase de tema)');
+      expect(prompt).toContain('CERTO (orienta de fato)');
+    });
+
+    test('a personalidade fala por ultimo sobre o tom da entrada', () => {
+      // Os exemplos genericos estao em voz neutra; se viessem depois do bloco
+      // da persona, dominariam o tom das duas personalidades.
+      const neutros = prompt.indexOf('Os exemplos acima estao em voz neutra');
+      const persona = prompt.indexOf('Linha de entrada no registro');
+      expect(neutros).toBeGreaterThan(-1);
+      expect(neutros).toBeLessThan(persona);
+    });
+
+    test('a linha de entrada nao afrouxa o grounding', () => {
+      expect(prompt).toContain('nomeia o que os trechos mostram, nunca uma suposicao sobre o caso de quem perguntou');
+    });
+
+    test('o que a entrada NAO pode ser continua barrado', () => {
+      expect(prompt).toContain('fora a linha de entrada, NADA precede a resposta');
+      expect(prompt).toContain('nem anuncio do que voce vai fazer');
+      expect(prompt).toContain('Quem ler apenas a abertura ja sabe o que fazer');
+    });
+
+    test('no modo procedimental a abertura segue a mesma regra da linha de entrada', () => {
+      expect(prompt).toContain('Valem aqui a regra e o teto da linha de entrada (5A.1a)');
+      expect(prompt).toContain('um fato concreto dos trechos, UMA frase');
     });
 
     test('define as partes da resposta pontual na ordem abertura -> desenvolvimento -> fundamentacao', () => {
@@ -844,12 +905,52 @@ describe('buildRagPrompt', () => {
     expect(prompt).toContain('COBERTURA COMPLETA DOS DISPOSITIVOS SELECIONADOS');
   });
 
-  test('exige um bloco por dispositivo, titulado pela finalidade, sem categorias inventadas', () => {
-    expect(prompt).toContain('ESTRUTURA E FORMATO');
-    expect(prompt).toContain('um dispositivo por bloco');
-    // proibe titulos-fase / categorias inventadas pelo modelo
-    expect(prompt).toContain('PROIBIDO transformar dispositivos em fases');
-    expect(prompt).toContain('COBERTURA COMPLETA');
+  // O modo procedimental produzia uma resposta com o formato do INDICE DA
+  // NORMA: um bloco por item, titulado pela finalidade do item, com a citacao
+  // embaixo. Estes testes travam o que passou a distingui-la de um roteiro de
+  // trabalho — sem abrir mao de nenhuma garantia de cobertura.
+  describe('modo procedimental — roteiro de trabalho, nao indice da norma', () => {
+    test('a abertura orienta o trabalho em vez de anunciar a lista', () => {
+      expect(prompt).toContain('ABERTURA (uma frase, no lugar da antiga introducao)');
+      expect(prompt).toContain('em quantos momentos ela se divide e quais sao');
+      // o exemplo antigo era, ele proprio, a frase de tema que o modelo copiava
+      expect(prompt).toContain('ERRADO (sumario / frase de tema)');
+      expect(prompt).toContain('A fiscalizacao mensal se divide em tres momentos');
+      expect(prompt).not.toContain(
+        'Introducao: um unico paragrafo curto resumindo o contexto',
+      );
+    });
+
+    test('o titulo pode nomear o momento QUANDO a norma o declara', () => {
+      expect(prompt).toContain('o MOMENTO do trabalho em que ele incide');
+      expect(prompt).toContain('SOMENTE quando o proprio dispositivo declara esse momento');
+      expect(prompt).toContain('Titular pelo momento que a NORMA declara nao e interpretacao sua');
+    });
+
+    test('categoria inventada continua proibida, e o momento nao pode ser deduzido', () => {
+      expect(prompt).toContain('PROIBIDAS continuam as categorias INVENTADAS por voce');
+      expect(prompt).toContain('Outras verificacoes');
+      expect(prompt).toContain('Se o momento nao estiver escrito no dispositivo, titule pela finalidade — nunca deduza o momento');
+      // a proibicao larga (qualquer titulo-fase) saiu: era ela que mantinha a
+      // resposta com o formato do indice da norma
+      expect(prompt).not.toContain('PROIBIDO transformar dispositivos em fases');
+    });
+
+    test('a frase do bloco e traducao para o trabalho, nao recorte da norma', () => {
+      expect(prompt).toContain('e uma TRADUCAO, nunca um recorte');
+      expect(prompt).toContain('ERRADO (recorte da norma)');
+      expect(prompt).toContain('CERTO (traducao)');
+      expect(prompt).toContain('o que menos tolera a redacao da norma recolada');
+    });
+
+    test('as garantias de cobertura e citacao seguem intactas', () => {
+      expect(prompt).toContain('ESTRUTURA E FORMATO');
+      expect(prompt).toContain('um dispositivo por bloco');
+      expect(prompt).toContain('UM DISPOSITIVO = UM BLOCO (regra inviolavel)');
+      expect(prompt).toContain('E PROIBIDO: fundir dois dispositivos num mesmo bloco');
+      expect(prompt).toContain('**Item X – Anexo Y – Documento Z**');
+      expect(prompt).toContain('COBERTURA COMPLETA');
+    });
   });
 
   test('define o contrato de Markdown da resposta (titulo, referencia, listas e espacamento)', () => {
@@ -916,6 +1017,63 @@ describe('buildRagPrompt', () => {
   // Registro e principio organizador — o que separava a resposta do GeFi
   // ("parecer juridico resumido") de uma resposta que conversa com o usuario.
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Sintese x transcricao
+  //
+  // O prompt sabia dizer o que NAO fazer (68 proibicoes) e nunca dizia que a
+  // resposta e escrita pelo modelo. Como copiar satisfaz todas as proibicoes de
+  // uma vez, a saida vinha literal. Estes testes travam o contrapeso.
+  // -------------------------------------------------------------------------
+  describe('a resposta e redigida, nao copiada', () => {
+    test('declara que a resposta e escrita pelo modelo, e o trecho e so a fonte', () => {
+      expect(prompt).toContain('A RESPOSTA E ESCRITA POR VOCE, NAO COPIADA DA NORMA');
+      expect(prompt).toContain('sao a FONTE do que voce afirma, nunca o TEXTO que voce entrega');
+    });
+
+    test('delimita as tres situacoes em que a copia literal e devida', () => {
+      // Sem uma fronteira explicita, "seja fiel" e lido como "copie".
+      expect(prompt).toContain('Reproduza a redacao original em apenas tres situacoes');
+      expect(prompt).toContain('numeros, prazos, valores, percentuais, nomes e designacoes');
+      expect(prompt).toContain('uma expressao curta cuja redacao exata muda o sentido');
+      expect(prompt).toContain('o tipo REPRODUCAO (secao 2e)');
+    });
+
+    test('mostra o contraste colagem x sintese fiel com exemplo concreto', () => {
+      expect(prompt).toContain('ERRADO (colagem)');
+      expect(prompt).toContain('CERTO (sintese fiel)');
+      // A confusao a desfazer: reescrever nao e resumir.
+      expect(prompt).toContain('Reescrever assim NAO e resumir: resumir e deixar coisa de fora');
+    });
+
+    test('cobertura passa a ser de conteudo, nao de redacao', () => {
+      expect(prompt).toContain('COBRIR NAO E TRANSCREVER');
+      expect(prompt).toContain('um dispositivo com oito alineas vira oito frases suas, nunca oito trechos copiados');
+      // As garantias de completude continuam de pe
+      expect(prompt).toContain('o fim da lista importa tanto quanto o inicio');
+      expect(prompt).toContain('entre outras rotinas');
+      // e o mandato de transcricao que as acompanhava saiu
+      expect(prompt).not.toContain('apresente-o por inteiro');
+      expect(prompt).not.toContain('foi apresentado integralmente');
+    });
+
+    test('o bullet procedimental e uma acao na redacao propria', () => {
+      expect(prompt).toContain('Cada bullet e UMA acao dita na sua redacao');
+      expect(prompt).toContain('nao recole o paragrafo da norma dentro do bullet');
+    });
+
+    test('a conferencia final checa colagem antes de tudo', () => {
+      expect(prompt).toContain('virou colagem do texto normativo');
+      expect(prompt).toContain('reescreva-o dizendo a mesma coisa em frase propria');
+      // A excecao continua explicita para nao quebrar o tipo REPRODUCAO
+      expect(prompt).toContain('Vale para o tipo REPRODUCAO ao contrario: la a copia e obrigatoria');
+    });
+
+    test('o modo REPRODUCAO segue intacto (copia continua sendo o pedido la)', () => {
+      expect(prompt).toContain('reproduza o texto literalmente, completo e na ordem original');
+      expect(prompt).toContain('nao resuma, nao reorganize, nao omita e nao acrescente nada');
+    });
+  });
+
   describe('registro conversacional e inversao do principio organizador', () => {
     test('a persona define a TAREFA (ajudar a decidir), nao o objeto (a norma)', () => {
       expect(prompt).toContain('Voce ajuda um servidor publico a resolver uma duvida concreta');
@@ -959,7 +1117,7 @@ describe('buildRagPrompt', () => {
 
     test('a conferencia final checa abertura tipada, registro e fidelidade', () => {
       expect(prompt).toContain('CONFERENCIA FINAL (todos os modos)');
-      expect(prompt).toContain('A PRIMEIRA PALAVRA pertence ao tipo pedido');
+      expect(prompt).toContain('A resposta chegou ate a SEGUNDA frase');
       expect(prompt).toContain('virou a ordem dos artigos?');
       expect(prompt).toContain('Sobrou "voce" dirigido ao leitor');
       expect(prompt).toContain('sai de algum trecho fornecido?');

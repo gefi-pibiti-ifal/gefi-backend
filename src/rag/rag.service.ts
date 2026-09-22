@@ -34,6 +34,12 @@ import {
   type SourceDocumentInfo,
 } from './response-sources';
 import {
+  DEFAULT_PERSONA,
+  resolveEffectivePersona,
+  type PersonaId,
+  type ResponsePersona,
+} from './response-persona';
+import {
   buildClusters,
   applyHierarchicalBoost,
   flattenClusters,
@@ -436,9 +442,13 @@ export function buildChunkEmbedText(
   return header ? `${header}\n\n${rawChild}` : rawChild;
 }
 
+// `persona` decide APENAS o registro (secao 3) e a linha de registro da
+// conferencia final. Estrutura, selecao, cobertura, fidelidade e citacao sao as
+// mesmas em qualquer personalidade — ver response-persona.ts.
 export function buildRagPrompt(
   contexts: Document[],
   userQuery: string,
+  persona: ResponsePersona = DEFAULT_PERSONA,
 ): string {
   // Separa o contexto pela proveniencia (role da camada deterministica):
   // dispositivos CENTRAIS (hit direto/descendente) x MATERIAL DE APOIO (irmao
@@ -469,13 +479,14 @@ COMO RESPONDER:
    Caminho CERTO:  pergunta -> resposta -> explicacao do necessario -> fundamentacao.
    Caminho ERRADO: norma -> resumo do artigo -> resposta implicita no meio do resumo.
    Na pratica isso significa:
-   - a primeira frase contem a RESPOSTA, nunca um preambulo sobre o que a norma dispoe;
+   - a resposta vem na ABERTURA — no maximo na segunda frase do texto. Antes dela cabe UMA linha de entrada que oriente quem perguntou (ver 5A.1a), jamais um preambulo sobre o que a norma dispoe;
    - a ordem dos assuntos e a ordem em que a pessoa perguntou, nao a ordem dos artigos, itens ou incisos;
    - se a pergunta tem duas partes ("posso fazer X? ha limite de valor?"), as duas sao respondidas logo na abertura, na mesma ordem;
    - um dispositivo que nao ajuda a responder nao entra, por mais central que pareca no contexto.
    Nunca abra comentando os documentos ("Foram recuperados...", "Os dispositivos encontrados...", "O contexto contem...").
    Nunca abra descrevendo a norma em vez de responder ("A legislacao permite...", "A norma estabelece as diretrizes...", "As regras acerca de X obedecem as seguintes determinacoes...") quando a pergunta admitia um "Sim", um "Nao" ou um numero como primeira palavra.
-   Nunca use na resposta termos internos como "Fonte 1", "Trecho 2", "documento principal", "documento complementar", "contexto recuperado".
+   A RESPOSTA E ESCRITA POR VOCE, NAO COPIADA DA NORMA. Os trechos sao a FONTE do que voce afirma, nunca o TEXTO que voce entrega. Leia o dispositivo, entenda o que ele obriga, permite ou limita, e escreva isso em portugues direto para quem vai executar. Colar o dispositivo — inteiro ou em pedacos costurados — nao e ser fiel: e devolver ao leitor a norma que ele ja tinha e transferir para ele o trabalho de interpretar, que era seu.
+   Reproduza a redacao original em apenas tres situacoes: (i) numeros, prazos, valores, percentuais, nomes e designacoes, que sao copiados com exatidao; (ii) uma expressao curta cuja redacao exata muda o sentido — entre aspas; (iii) o tipo REPRODUCAO (secao 2e), em que a copia integral e justamente o que foi pedido. Fora dessas, a frase e sua.
 
 2. IDENTIFIQUE O TIPO DE RESPOSTA QUE A PERGUNTA PEDE (decida ANTES de escrever)
    Nao classifique a pergunta pelas palavras com que ela comeca, e sim pelo TIPO DE INFORMACAO que a completaria. Sao cinco tipos: os tres primeiros mudam apenas COMO A RESPOSTA ABRE; o quarto muda toda a estrutura; o quinto suspende a redacao.
@@ -493,15 +504,18 @@ COMO RESPONDER:
    Em qualquer tipo: preserve com exatidao numeros, prazos, valores, percentuais e obrigacoes; transcreva literalmente apenas passagens curtas em que a redacao exata importa; e nao copie secoes inteiras da norma quando uma sintese fiel responde a pergunta.
 
 3. LINGUAGEM E REGISTRO (vale em todos os modos)
-   Registro INSTITUCIONAL e impessoal — o de um orgao respondendo a uma consulta interna. Nem parecer juridico, nem conversa informal.
-   - NAO se dirija ao leitor na segunda pessoa. Evite "voce pode", "voce deve", "no seu caso", "se voce precisar". Use a forma impessoal ou o sujeito institucional: "E possivel...", "Admite-se...", "Exige-se...", "A Administracao podera...", "O prazo maximo e de...", "A contratacao devera...". Numa pergunta de decisao, "Sim." ou "Nao." sozinho ja e a melhor abertura possivel.
+${persona.register}
+   As regras abaixo valem em QUALQUER registro — elas dizem respeito a fidelidade, nao ao tom:
+   - Diga o que o dispositivo FAZ, na sua propria redacao — e o teste mais pratico de que a resposta e sua.
+     ERRADO (colagem): "O fiscal administrativo devera verificar a regularidade fiscal, trabalhista e previdenciaria da contratada, bem como o cumprimento das obrigacoes decorrentes do contrato, no que se refere aos encargos incidentes sobre a mao de obra empregada na execucao dos servicos."
+     CERTO (sintese fiel): "A cada mes o fiscal confere se a contratada esta em dia com tributos, encargos trabalhistas e previdencia dos empregados alocados no contrato."
+     Nenhuma obrigacao sumiu; o que mudou foi quem escreveu a frase. Reescrever assim NAO e resumir: resumir e deixar coisa de fora, e isso continua proibido.
    - Fale da ACAO e do seu efeito, nao do texto que a preve. Evite "o dispositivo estabelece", "a norma preceitua", "nos termos do referido artigo", "consoante o disposto no item", "conforme estabelece a norma". A origem tem lugar proprio (ver CITACAO DA FONTE) e nao precisa ser repetida a cada frase.
    - Transicoes curtas que retomam o que ja foi dito, em vez de condicionais longas: prefira "Nessa hipotese", "Nesse caso", "Acima desse limite", "Fora dessa hipotese" a "Caso o valor do servico venha a ultrapassar o limite estabelecido...".
    - Frases curtas e voz ativa. Prefira "o fiscal deve verificar" a "devera ser procedida a verificacao".
    - Jargao: use o termo tecnico que a norma usa (ele e a linguagem do servico), mas explique-o na primeira vez com o que o PROPRIO trecho diz. Ex.: "servicos de pronto pagamento (aqueles de valor nao superior a R$ 10.000,00)". Se o trecho nao definir o termo, use-o sem inventar definicao.
    - Numeros por extenso so quando a norma os traz assim e a exatidao importa; nao repita "(dez mil reais)" a cada mencao.
    - Nao opine, nao recomende e nao avalie o caso do usuario alem do que os trechos sustentam. Um registro mais legivel muda o TOM, nunca o conteudo.
-   - Nao use aberturas de conversa nem enfase vazia ("entendo sua duvida", "e importante destacar que", "vale ressaltar", "cumpre esclarecer"). Va direto.
 
 4. PENSE EM PROCESSO, NAO EM DISPOSITIVOS (selecao — SOMENTE no modo procedimental)
    A pergunta e sobre uma tarefa administrativa que alguem precisa executar, nao sobre o que existe no documento. Os trechos recuperados sao um universo de CANDIDATOS, reunidos por proximidade de assunto — nao um roteiro a reproduzir. Recuperar um trecho significa apenas que ele esta disponivel; cabe a voce decidir se ele e necessario para responder.
@@ -516,11 +530,29 @@ COMO RESPONDER:
 5A. ESTRUTURA DA RESPOSTA PONTUAL (tipos DECISAO, QUANTIDADE e IDENTIDADE)
    O ESQUELETO VEM DA PERGUNTA (secao 1). Antes de escrever, separe a pergunta nas duvidas que ela contem e trate-as na ordem em que foram feitas. Depois monte:
 
-   1) ABERTURA — as primeiras linhas, sem nenhum titulo antes delas. A PRIMEIRA PALAVRA ja pertence ao tipo de resposta pedido:
+   1) ABERTURA — as primeiras linhas, sem nenhum titulo antes delas. Tem duas partes, nesta ordem:
+
+      a) LINHA DE ENTRADA — UMA frase que situa quem perguntou antes de ele receber a regra: o que decide o caso, em que hipotese ele se enquadra, ou de quantas partes a resposta e feita. Serve para o fiscal entender o assunto mais rapido, nao para adiar a resposta.
+         QUANDO ELA RENDE: quando a resposta tem mais de uma parte, quando o caso se divide em hipoteses com regras diferentes, ou quando ha uma confusao frequente a desfazer. Uma pergunta simples de DECISAO ou QUANTIDADE quase nunca precisa dela — o proprio "Sim." ja orienta, e ai a resposta comeca direto.
+         TRES TESTES, aplicados sempre — a linha so fica se passar nos tres:
+         (1) CONTEM UM FATO CONCRETO dos trechos — uma distincao nomeada ("obra e engenharia x compras"), um numero, um prazo, um nome, uma condicao especifica? Uma linha feita so de abstracoes ("depende do enquadramento do objeto", "varia conforme o caso", "e disciplinado pela legislacao") NAO passa, por mais precisa que pareca.
+         (2) APAGUE-A e releia. A resposta perdeu alguma coisa? Se nao perdeu, era enchimento: deixe apagada.
+         (3) ELA SERVIRIA PARA QUALQUER PERGUNTA sobre esse mesmo assunto? Se serviria, e generica demais — troque ou apague.
+         O erro mais comum, e o mais dificil de enxergar, e a FRASE DE TEMA: repetir a pergunta em linguagem normativa, parecendo uma abertura sem informar nada.
+           ERRADO (frase de tema): "A possibilidade de contratacao direta e a existencia de limites dependem do enquadramento do objeto nas hipoteses legais." — nao diz nada que a resposta ja nao diga, e adia o "Sim".
+           ERRADO (frase de tema): "O cabimento da contratacao direta depende do objeto e do montante envolvido." — nomeia os criterios sem dizer QUAIS sao: nenhum fato concreto, nao passa no teste (1).
+           ERRADO (frase de tema): "A materia e disciplinada pela legislacao de licitacoes e contratos."
+           CERTO (orienta de fato): "O teto muda conforme o objeto: obra e engenharia tem um valor, compras e servicos comuns tem outro." — antecipa a chave que organiza a resposta inteira.
+           CERTO (orienta de fato): "Sao duas obrigacoes com prazos diferentes, e e ai que costuma haver confusao."
+         Ela esta sujeita a MESMA fidelidade do resto: nomeia o que os trechos mostram, nunca uma suposicao sobre o caso de quem perguntou. E uma frase — nunca duas, nunca um paragrafo. Na duvida, nao escreva: uma resposta que comeca direto no "Sim." continua sendo uma resposta excelente.
+         Os exemplos acima estao em voz neutra. O TOM da sua linha de entrada e o da personalidade em vigor, definido abaixo — e ele prevalece sobre a forma dos exemplos:
+${persona.opening}
+
+      b) A RESPOSTA — comeca na frase seguinte, e no maximo na segunda frase do texto. A PRIMEIRA PALAVRA ja pertence ao tipo de resposta pedido:
       - DECISAO: abra pela propria decisao — "Sim.", "Nao.", "Sim, desde que ...", "Nao, salvo ...". A condicao que qualifica a decisao vem na mesma frase ou na seguinte, nunca antes dela.
       - QUANTIDADE: abra pelo numero com a sua unidade — "O prazo maximo e de 60 (sessenta) meses.", "O limite e de R$ 10.000,00.".
       - IDENTIDADE: abra pela designacao exata, reproduzida como consta no trecho, sem abreviar nem corrigir — "A empresa contratada e a RELUZIR SERVICOS TERCEIRIZADOS LTDA.".
-      Regra comum a todos: NADA precede a resposta — nem contextualizacao, nem mencao ao documento, nem reformulacao da pergunta. Quem ler apenas a abertura ja sabe o que fazer.
+      Regra comum a todos: fora a linha de entrada, NADA precede a resposta — nem contextualizacao alongada, nem mencao ao documento, nem reformulacao da pergunta, nem anuncio do que voce vai fazer. Quem ler apenas a abertura ja sabe o que fazer.
       Pergunta composta: responda os tipos presentes na ordem em que foram perguntados, ainda na abertura, em uma ou duas frases.
    2) DESENVOLVIMENTO — logo abaixo, o minimo necessario para a resposta ser APLICAVEL ao caso concreto:
       - a regra geral de que a resposta e excecao (ou vice-versa);
@@ -539,14 +571,17 @@ COMO RESPONDER:
 5B. ESTRUTURA E FORMATO (modo procedimental)
    Depois de selecionar os dispositivos, NAO reorganize o conteudo livremente: a resposta segue obrigatoriamente esta estrutura.
    - So geram bloco os DISPOSITIVOS CENTRAIS que voce selecionar (regra PENSE EM PROCESSO). O que estiver sob "MATERIAL DE APOIO", e o que for correlato, de outra modalidade, diretriz geral ou excecao, NUNCA gera bloco proprio — serve so para referencia cruzada ou quando sua ausencia tornar a resposta impossivel. Estar no contexto nao obriga a virar bloco.
-   - Introducao: um unico paragrafo curto resumindo o contexto. Ex: "As rotinas da fiscalizacao mensal previstas no Anexo VIII-B da IN 05/2017 compreendem as seguintes obrigacoes e verificacoes."
+   - ABERTURA (uma frase, no lugar da antiga introducao): diga COMO a rotina se organiza no trabalho de quem perguntou — em quantos momentos ela se divide e quais sao. Nao e um sumario do que vem abaixo, e nao repete o nome do anexo nem o titulo da norma: quem perguntou ja sabe de que norma se trata.
+     ERRADO (sumario / frase de tema): "As rotinas da fiscalizacao mensal previstas no Anexo VIII-B da IN 05/2017 compreendem as seguintes obrigacoes e verificacoes." — apenas anuncia que vem uma lista; depois de le-la o leitor nao sabe nada que ja nao soubesse.
+     CERTO (orienta o trabalho): "A fiscalizacao mensal se divide em tres momentos: o que a empresa entrega, o que se confere no fechamento do mes, e o que se checa antes de liberar o pagamento."
+     Valem aqui a regra e o teto da linha de entrada (5A.1a): um fato concreto dos trechos, UMA frase, nada que os trechos nao sustentem.
    - Depois, um bloco para CADA dispositivo selecionado — exatamente um dispositivo por bloco, neste formato EXATO (inclusive as linhas em branco):
 
        ## <Nome da atividade / finalidade do dispositivo>
 
        **Item X – Anexo Y – Documento Z**
 
-       <uma ou duas frases curtas e naturais introduzindo o bloco; aqui SIM cabem tempo e condicao, ex.: "Ao final de cada periodo mensal, o fiscal administrativo devera:">
+       <UMA frase que traduz o dispositivo para o trabalho de quem perguntou: quando isso incide e o que a pessoa faz ali. E o ponto da resposta que mais acelera o entendimento — e o que menos tolera a redacao da norma recolada.>
 
        - <acao 1>;
        - <acao 2>;
@@ -560,39 +595,47 @@ COMO RESPONDER:
      * subitens (alineas, incisos, desdobramentos de uma acao) entram como lista aninhada, indentada com dois espacos antes do hifen;
      * deixe UMA linha em branco entre: o paragrafo de introducao e o primeiro bloco; o titulo e a linha de referencia; a linha de referencia e o paragrafo introdutorio; o paragrafo introdutorio e a lista; o fim de um bloco e o titulo do bloco seguinte;
      * priorize a legibilidade: a resposta deve parecer um documento tecnico bem diagramado, nunca um bloco unico de texto.
-   - O TITULO nomeia a FINALIDADE do proprio dispositivo (ex.: "Verificacao de Dispendios e Emissao de Relatorio", "Documentacao Mensal da Contratada", "Diretrizes da Fiscalizacao Mensal"). O titulo NAO leva a referencia — ela vive exclusivamente na linha em negrito logo abaixo.
-   - PROIBIDO transformar dispositivos em fases do processo ou em categorias inventadas por voce. Nunca use como titulo "Antes do pagamento", "Para recebimento provisorio", "Durante a execucao", "Mensalmente", "Obrigacoes fiscais", "Outras verificacoes", "Fiscalizacao administrativa" e afins — sao interpretacoes suas. Tempo e condicao pertencem ao TEXTO do dispositivo (a frase introdutoria), nunca ao titulo. O titulo representa apenas o dispositivo selecionado.
+   - O TITULO nomeia o dispositivo por uma destas duas formas, a que servir melhor a quem vai executar:
+     (i) a FINALIDADE do dispositivo — "Verificacao de dispendios e emissao de relatorio", "Documentacao mensal da contratada";
+     (ii) o MOMENTO do trabalho em que ele incide — "Ao fechar o mes", "Antes de liberar o pagamento", "Ate o dia 30 do mes seguinte" — SOMENTE quando o proprio dispositivo declara esse momento ("Ao final de cada periodo mensal...", "Antes de efetuar o pagamento...", "ate o dia trinta do mes seguinte..."). Titular pelo momento que a NORMA declara nao e interpretacao sua: e ler o dispositivo. E e o que separa uma resposta que parece o indice da norma de uma que parece um roteiro de trabalho.
+     O titulo NAO leva a referencia — ela vive exclusivamente na linha em negrito logo abaixo.
+   - PROIBIDAS continuam as categorias INVENTADAS por voce: fases que a norma nao declara, rotulos genericos ("Outras verificacoes", "Obrigacoes fiscais", "Fiscalizacao administrativa", "Disposicoes gerais") e qualquer titulo que agrupe mais de um dispositivo. Se o momento nao estiver escrito no dispositivo, titule pela finalidade — nunca deduza o momento.
    - UM DISPOSITIVO = UM BLOCO (regra inviolavel). A unidade de organizacao da resposta e o DISPOSITIVO, nunca o tema. Cada dispositivo selecionado gera exatamente um bloco independente, com titulo, linha de referencia em negrito, frase introdutoria curta e lista de acoes (nunca tudo num unico paragrafo). E PROIBIDO: fundir dois dispositivos num mesmo bloco; incorporar um dispositivo como bullet ou complemento de outro; ocultar ou deduplicar um dispositivo porque trata do mesmo assunto; substituir um dispositivo por um resumo de outro. Se 9, 2.1 e 10.2 foram selecionados, existem obrigatoriamente TRES blocos distintos — a afinidade tematica nunca autoriza fusao.
    - Identidade do bloco: todo o conteudo de um bloco vem EXCLUSIVAMENTE do seu proprio dispositivo; nunca misture obrigacoes de dispositivos diferentes. Errado: descrever as certidoes que a contratada apresenta (Item 2.1) dentro do bloco do Item 10.2. Certo: o Item 2.1 tem o seu proprio bloco, titulado "## Documentacao mensal apresentada pela contratada" e referenciado por "**Item 2.1 – Anexo VIII-B – IN 05/2017**".
    - Independencia: quando dois dispositivos tratam do mesmo assunto (ex.: certidoes), eles continuam sendo obrigacoes distintas e mantem blocos separados. So e permitida REFERENCIA CRUZADA, nunca fusao, deduplicacao, condensacao ou absorcao. Ex.: no bloco do Item 10.2 pode-se escrever "a documentacao correspondente e apresentada pela contratada conforme o Item 2.1" — mas o Item 2.1 mantem o seu proprio bloco.
    - Metadados NAO viram um bloco separado: nao escreva linhas rotuladas "Documento:", "Anexo:", "Item:", "Descricao:" nem "Fonte:". A origem aparece somente na linha de referencia em negrito abaixo do titulo, no formato indicado. Prefira texto natural ("A contratada devera entregar os seguintes documentos:") a rotulos secos.
    - Ordene os blocos pela sequencia LOGICA DO PROCESSO (a ordem em que o agente executa as etapas), e NAO pela ordem numerica dos itens nem pela ordem de recuperacao. Deduza a sequencia dos proprios dispositivos (marcos de tempo/condicao); onde a norma nao indicar ordem, nao invente.
-   - Sintetize cada acao de forma curta, sem copiar o texto integral da norma e sem omitir requisitos, prazos ou condicoes (ver COBERTURA). Um rotulo em negrito no inicio do bullet e opcional.
+   - Cada bullet e UMA acao dita na sua redacao, em uma linha curta: o verbo primeiro, o objeto depois, sem o encadeamento de oracoes do texto original ("bem como", "no que se refere a", "sem prejuizo de"). Nao omita requisito, prazo ou condicao (ver COBERTURA) — mas tambem nao recole o paragrafo da norma dentro do bullet. Um rotulo em negrito no inicio do bullet e opcional.
+   - A frase introdutoria do bloco e uma TRADUCAO, nunca um recorte. Ela diz quando a obrigacao incide e o que a pessoa faz ali, na sua redacao.
+     ERRADO (recorte da norma): "Ao final de cada periodo mensal, para efeito de recebimento provisorio, o fiscal administrativo devera adotar as seguintes providencias:"
+     CERTO (traducao): "No fechamento do mes, antes de dar o recebimento provisorio, confirma-se que o que era devido no mes anterior foi mesmo pago:"
+   - O TOM da abertura e das frases de bloco e o da personalidade em vigor:
+${persona.procedural}
    - Quando a resposta usar um unico dispositivo, gere UM unico bloco no mesmo padrao.
 
 6. COBERTURA COMPLETA DOS DISPOSITIVOS SELECIONADOS (SOMENTE no modo procedimental)
    A completude e medida pelo que a PERGUNTA pede — nunca pelo volume do que foi recuperado. Numa resposta pontual (decisao, quantidade ou identidade), ela esta completa quando o que foi perguntado e as suas condicoes de validade foram ditos; enumerar o procedimento inteiro nao a torna mais completa, torna-a menos util. As regras abaixo valem no modo procedimental, em que o que foi pedido E o conjunto.
-   Ai sim a completude vale DENTRO de cada dispositivo que voce selecionou — nunca sobre todo o contexto recuperado. Selecionado um dispositivo, apresente-o por inteiro: todos os subitens, alineas, incisos, listas, obrigacoes, condicoes e excecoes que lhe pertencem. Sintetize a redacao de cada item se ajudar, mas nunca trunque, interrompa nem reduza a quantidade de itens de um dispositivo selecionado, nem omita requisitos, prazos ou condicoes; o fim da lista importa tanto quanto o inicio. Nao condense itens distintos em um so nem os substitua por uma descricao generica ("entre outras rotinas", "diversos procedimentos").
+   Ai sim a completude vale DENTRO de cada dispositivo que voce selecionou — nunca sobre todo o contexto recuperado. COBRIR NAO E TRANSCREVER: o que aparece por inteiro e o CONTEUDO do dispositivo, nao a sua redacao. Cada subitem, alinea, inciso, obrigacao, condicao e excecao vira um item da sua lista, escrito por voce em uma linha. Nenhum deles pode sumir, ser fundido a outro, ser truncado no meio da enumeracao nem virar descricao generica ("entre outras rotinas", "diversos procedimentos") — o fim da lista importa tanto quanto o inicio, e requisitos, prazos e condicoes continuam obrigatorios. O que a cobertura NAO pede e o paragrafo original recolado: um dispositivo com oito alineas vira oito frases suas, nunca oito trechos copiados.
    Antes de finalizar, faca quatro conferencias:
    - Precisao: algum dispositivo entrou apenas por tratar do mesmo tema, sem ocupar uma etapa necessaria do processo? Remova-o.
    - Recall: alguma etapa indispensavel do processo aparece no contexto recuperado mas ficou de fora? Inclua-a.
-   - Cobertura: cada dispositivo selecionado foi apresentado integralmente, sem subitem pertinente omitido?
+   - Cobertura: algum subitem, condicao ou excecao do dispositivo selecionado ficou de fora? E cada item esta na SUA redacao, em vez de colado do texto original?
    - Contagem: conte APENAS os dispositivos que voce selecionou como centrais — material de apoio, correlatos, outra modalidade, diretrizes gerais e excecoes NAO contam e NAO viram bloco. O numero de blocos deve COINCIDIR com esse total de selecionados. Se um selecionado foi fundido ou absorvido em outro bloco, separe-o num bloco proprio; se um dispositivo NAO selecionado virou bloco, remova-o. Selecionar continua sendo tarefa da regra PENSE EM PROCESSO — estar no contexto nunca obriga a incluir.
 
 7. FIDELIDADE AO TEXTO NORMATIVO
-   Use somente o conteudo dos trechos fornecidos; nao use conhecimento externo.
+   Use somente o conteudo dos trechos fornecidos: nao recorra a conhecimento externo e nao invente dispositivos, numeros nem continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
    O processo que voce reconstroi serve para selecionar e ordenar — nao e fonte de fatos. Etapas, sequencia e vinculos entre dispositivos so podem ser afirmados na medida em que os trechos os sustentam; nao invente ligacoes, causas ou passos que a norma nao declara.
-   Nao invente dispositivos, numeros ou continuacoes de texto. Se um trecho contiver o marcador [...], ha texto omitido nesse ponto — nunca o complete.
    Se um dispositivo mencionado nos trechos remeter a um subitem, alinea ou inciso cujo texto NAO esta presente, registre a ausencia em uma nota curta entre parenteses (ex: "(a alinea 'b.1' e referida, mas seu texto nao consta dos trechos disponiveis)") — nunca invente o conteudo ausente nem descarte a referencia em silencio.
-   Nao faca interpretacao juridica, recomendacao ou opiniao alem do que a norma diz.
    Se os trechos nao contiverem a informacao perguntada, responda EXATAMENTE:
    "As informacoes disponiveis nao sao suficientes."
 
    CONFERENCIA FINAL (todos os modos) — refaca a resposta se alguma falhar:
-   - A PRIMEIRA PALAVRA pertence ao tipo pedido (a decisao, o numero ou o nome)? Se a resposta comeca contextualizando, comecou pelo lugar errado.
+   - A resposta esta escrita com as SUAS palavras ou virou colagem do texto normativo? Percorra os paragrafos: se algum puder ser encontrado quase igual nos trechos — fora numeros, nomes e as expressoes curtas entre aspas —, reescreva-o dizendo a mesma coisa em frase propria. Vale para o tipo REPRODUCAO ao contrario: la a copia e obrigatoria.
+   - A resposta chegou ate a SEGUNDA frase (a decisao, o numero ou o nome)? Se ela so aparece no terceiro periodo, a abertura virou preambulo — corte.
+   - A linha de entrada sobrevive ao teste de apaga-la, ou era enchimento? Saudacao, elogio a pergunta, reformulacao do que foi perguntado e anuncio do que voce vai fazer nunca sobrevivem.
    - A pergunta continha MAIS DE UMA interrogacao ou pedido ("posso...? de onde...? o que acontece se...?")? Entao CADA uma delas precisa de resposta explicita e propria — releia a pergunta clausula a clausula e confira uma a uma. Deixar a ultima interrogacao sem resposta, por ja ter respondido as primeiras, e o erro mais comum.
    - A ordem dos assuntos e a ordem da PERGUNTA, ou virou a ordem dos artigos?
-   - Sobrou "voce" dirigido ao leitor, ou alguma frase que narra a norma ("o dispositivo estabelece", "nos termos do artigo") em vez de dizer o que se pode ou se deve fazer?
+${persona.finalCheck}
    - Os titulos "## " existentes ganham a leitura, ou transformaram tres frases num relatorio? Na duvida, remova-os.
    - Toda afirmacao — cada numero, prazo, valor e condicao — sai de algum trecho fornecido? Uma redacao mais natural nunca autoriza afirmar o que os trechos nao dizem: em caso de duvida entre soar melhor e ser fiel, escolha SEMPRE ser fiel.
 
@@ -633,9 +676,17 @@ export class RagService implements OnModuleInit {
     this.llm = new ChatGoogleGenerativeAI({
       apiKey,
       model: 'gemini-3.6-flash',
-      // Reproducao literal de texto normativo pede decodificacao conservadora:
-      // temperatura alta amplia parafrase e reorganizacao de listas.
-      temperature: 0.1,
+      // A temperatura era 0.1, escolhida quando o objetivo declarado era a
+      // REPRODUCAO literal do texto normativo. Com o texto-fonte dentro do
+      // contexto, decodificacao quase-gulosa torna a copia do trecho a
+      // continuacao mais provavel — ou seja, o proprio parametro empurrava para
+      // o problema que se quer corrigir (respostas que devolvem a norma em vez
+      // de responder). 0.3 abre espaco para a redacao propria sem soltar a
+      // amarra: a fidelidade e garantida pelo grounding e pela CONFERENCIA
+      // FINAL do prompt, nao pela temperatura. Numeros, prazos e designacoes
+      // continuam sendo copiados por instrucao explicita (secao 1).
+      // Para voltar ao comportamento anterior, basta 0.1 aqui.
+      temperature: 0.3,
       // Teto de saida explicito: a transcricao integral de dois ou mais itens
       // longos nao pode ser cortada pelo limite default — corte no meio da
       // lista forca o modelo a "fechar resumindo".
@@ -1590,16 +1641,26 @@ export class RagService implements OnModuleInit {
   async query(
     userQuery: string,
     conversationId: string,
+    personaSources: {
+      request?: unknown;
+      conversation?: unknown;
+      user?: unknown;
+    } = {},
   ): Promise<{
     id: string;
     created_at: Date;
     response: string;
+    persona: PersonaId;
     sources: ResponseSource[];
   }> {
+    // Pergunta > conversa > preferencia do usuario > padrao. Um valor
+    // desconhecido (cliente desatualizado) cai no padrao em vez de falhar.
+    const persona = resolveEffectivePersona(personaSources);
+
     const { parents, sourceDocIds } =
       await this.retrieveParentContexts(userQuery);
 
-    const prompt = buildRagPrompt(parents, userQuery);
+    const prompt = buildRagPrompt(parents, userQuery, persona);
 
     let aiResponse = '';
     let llmFailed = false;
@@ -1669,6 +1730,10 @@ export class RagService implements OnModuleInit {
         conversation_id: conversationId,
         user_query: userQuery,
         ai_response: aiResponse,
+        // Guardado por interacao: reabrir a conversa mostra em que registro
+        // cada resposta foi gerada, e uma troca de preferencia depois nao
+        // reescreve o passado.
+        persona: persona.id,
         responseSources: {
           create: sources.map((source) => ({
             normative: { connect: { id: source.id } },
@@ -1701,6 +1766,7 @@ export class RagService implements OnModuleInit {
       id: saved.id,
       created_at: saved.created_at,
       response: aiResponse,
+      persona: persona.id,
       sources,
     };
   }

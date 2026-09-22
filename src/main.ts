@@ -11,7 +11,12 @@ async function bootstrap() {
 
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe());
-  app.enableCors();
+  app.enableCors({
+    // Sem exposedHeaders, o JavaScript do frontend nao consegue LER
+    // Content-Disposition numa resposta cross-origin — e o download acaba
+    // salvando o arquivo com um nome inventado pelo navegador.
+    exposedHeaders: ['Content-Disposition', 'Content-Length'],
+  });
 
   const config = new DocumentBuilder()
     .setTitle('GeFi Docs API (NestJS)')

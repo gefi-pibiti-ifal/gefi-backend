@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException } from '@nestjs/common';
-import { DocumentsService, buildContentDisposition } from './documents.service';
+import { DocumentsService } from './documents.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 const DOCUMENT = {
@@ -222,36 +222,5 @@ describe('DocumentsService', () => {
       const select = args.select;
       expect(select.file_data).toBeUndefined();
     });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Content-Disposition — o nome vem do upload, entao e entrada de usuario.
-// ---------------------------------------------------------------------------
-describe('buildContentDisposition', () => {
-  test('inline para visualizacao, attachment para download', () => {
-    expect(buildContentDisposition('inline', 'norma.pdf')).toContain('inline;');
-    expect(buildContentDisposition('attachment', 'norma.pdf')).toContain('attachment;');
-  });
-
-  test('preserva acentos na forma RFC 5987 e mantem um fallback ASCII', () => {
-    const header = buildContentDisposition('attachment', 'Instrução Normativa.pdf');
-
-    expect(header).toContain("filename*=UTF-8''Instru%C3%A7%C3%A3o%20Normativa.pdf");
-    expect(header).toContain('filename="Instru__o Normativa.pdf"');
-  });
-
-  test('remove quebras de linha e aspas (injecao de cabecalho)', () => {
-    const header = buildContentDisposition(
-      'attachment',
-      'a"\r\nX-Injetado: sim\r\n.pdf',
-    );
-
-    expect(header).not.toMatch(/[\r\n]/);
-    expect(header).not.toContain('a"');
-  });
-
-  test('nome vazio cai num nome padrao', () => {
-    expect(buildContentDisposition('inline', '   ')).toContain('filename="documento.pdf"');
   });
 });
