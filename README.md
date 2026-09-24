@@ -30,7 +30,7 @@ O projeto segue a arquitetura modular do NestJS:
 ```bash
 cp .env.example .env    # veja abaixo as variáveis obrigatórias
 docker compose up --build
-curl http://localhost:3000/api
+curl http://localhost:3200/api
 ```
 
 Sobe dois containers: `gefi-postgres` (pgvector) e `gefi-api`. As migrations são
@@ -96,7 +96,7 @@ pré-cadastrados. A partir daí o cadastro dos demais é feito pela interface, e
 #### Deploy no servidor
 
 O serviço `api-deploy` (profile `deploy`) publica na porta **2999**, deixando a
-3000 livre para uso local no mesmo host:
+3200 livre para uso local no mesmo host:
 
 ```bash
 docker compose --profile deploy up -d --build api-deploy
@@ -202,4 +202,4 @@ Documentos enviados **antes** desta funcionalidade não têm arquivo original (`
 ## Documentação
 
 Acesse a documentação interativa em:
-[http://localhost:3000/api-docs](http://localhost:3000/api-docs)
+[http://localhost:3200/api-docs](http://localhost:3200/api-docs)

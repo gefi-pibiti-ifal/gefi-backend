@@ -2,13 +2,24 @@
 #   api         -> validacao local, comportamento padrao (sem profile)
 #   api-deploy  -> deploy no servidor, profile "deploy"
 #
-# Uso local (padrao) -- publica em 3000, apenas no loopback:
+# Uso local (padrao) -- publica em 3200, apenas no loopback:
 #   cp .env.example .env   # e preencha os valores
 #   docker compose up --build
-#   curl http://localhost:3000/api
+#   curl http://localhost:3200/api
+#
+# PORTAS NO HOST, para nao colidir com o frontend:
+#   3000   gefi-frontend em `pnpm dev`
+#   3100   gefi-frontend containerizado (servico `web`)
+#   3101   gefi-frontend containerizado (servico `web-dev`)
+#   3200   esta API (servico `api`)
+#   2999   esta API em deploy (servico `api-deploy`)
+#   5432   Postgres, so para clientes SQL locais
+#
+# Dentro da rede do compose nada disso vale: os containers falam entre si pelo
+# nome do servico e pela porta INTERNA, que continua sendo 3000.
 #
 # Deploy no servidor (com o .env do ambiente ja preenchido) -- publica em 2999,
-# deixando a 3000 livre para uso local no mesmo host:
+# deixando a 3200 livre para uso local no mesmo host:
 #   docker compose --profile deploy up -d --build api-deploy
 #   docker compose --profile deploy logs -f api-deploy
 #   docker compose --profile deploy down
@@ -82,8 +93,15 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
     ports:
+      # 3200 no HOST, 3000 no container.
+      #
+      # A 3000 do host pertence ao frontend: `pnpm dev` do gefi-frontend sobe
+      # nela, e as duas colidiam. Só o lado esquerdo do mapeamento mudou --
+      # dentro da rede do compose a API continua em `gefi-api:3000`, que e o
+      # que o DOCKER_API_UPSTREAM do frontend usa.
+      #
       # Loopback: em uso local nao ha motivo para expor na rede.
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3200:3000"
     depends_on:
       postgres:
         condition: service_healthy
