@@ -10,16 +10,25 @@ import {
   Res,
   BadRequestException,
   Query,
-  ForbiddenException,
   Delete,
   Param,
   StreamableFile,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiBody, ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiConsumes,
+  ApiBody,
+  ApiTags,
+  ApiOperation,
+  ApiQuery,
+} from '@nestjs/swagger';
 import type { Response } from 'express';
 import { createHash } from 'crypto';
+import { UserType } from '@prisma/client';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { Roles } from '../auth/roles.decorator';
+import { RolesGuard } from '../auth/roles.guard';
 import { DocumentsService, buildContentDisposition } from './documents.service';
 import { RagService } from '../rag/rag.service';
 import type { PageInput } from '../rag/document-location';
@@ -28,7 +37,10 @@ import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 
 @ApiTags('Documentos')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+// RolesGuard roda DEPOIS do JwtAuthGuard e depende disso: ele le req.user, que
+// so e preenchido pela autenticacao. As rotas sem @Roles seguem abertas a
+// qualquer usuario autenticado.
+@UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('documents')
 export class DocumentsController {
   constructor(
@@ -56,22 +68,23 @@ export class DocumentsController {
       fileFilter: (_, file, cb) => {
         file.mimetype === 'application/pdf'
           ? cb(null, true)
-          : cb(new BadRequestException('Apenas ficheiros PDF são permitidos'), false);
+          : cb(
+              new BadRequestException('Apenas ficheiros PDF são permitidos'),
+              false,
+            );
       },
     }),
   )
+  @Roles(UserType.ADMINISTRADOR)
   async upload(
     @UploadedFile() file: Express.Multer.File,
     @Body() body: { title: string; document_type: string },
     @Req() req: any,
   ) {
-
-    if (req.user.user_type !== 'ADMINISTRADOR') {
-      throw new ForbiddenException('Apenas administradores podem enviar documentos');
-    }
-
     if (!file?.buffer) {
-      throw new BadRequestException('Nenhum ficheiro recebido ou ficheiro vazio.');
+      throw new BadRequestException(
+        'Nenhum ficheiro recebido ou ficheiro vazio.',
+      );
     }
 
     let content: string;
@@ -83,8 +96,9 @@ export class DocumentsController {
     let pages: PageInput[] = [];
 
     try {
-
-      const blob = new Blob([new Uint8Array(file.buffer)], { type: 'application/pdf' });
+      const blob = new Blob([new Uint8Array(file.buffer)], {
+        type: 'application/pdf',
+      });
 
       const loader = new PDFLoader(blob, { splitPages: true });
 
@@ -101,7 +115,8 @@ export class DocumentsController {
         textByPage.set(pageNumber, doc.pageContent);
       });
       const totalPages =
-        (docs[0]?.metadata?.pdf?.totalPages as number | undefined) ?? docs.length;
+        (docs[0]?.metadata?.pdf?.totalPages as number | undefined) ??
+        docs.length;
       pages = Array.from({ length: totalPages }, (_, i) => ({
         page: i + 1,
         text: textByPage.get(i + 1) ?? '',
@@ -109,7 +124,10 @@ export class DocumentsController {
 
       // Texto identico ao da extracao sem divisao de paginas: o proprio loader
       // concatenava as paginas COM TEXTO usando este mesmo separador.
-      content = docs.map((doc) => doc.pageContent).join('\n\n').trim();
+      content = docs
+        .map((doc) => doc.pageContent)
+        .join('\n\n')
+        .trim();
 
       if (!content) {
         throw new BadRequestException(
@@ -120,7 +138,9 @@ export class DocumentsController {
       if (err instanceof BadRequestException) throw err;
 
       const message = err instanceof Error ? err.message : String(err);
-      throw new BadRequestException(`Falha na extração pelo LangChain: ${message}`);
+      throw new BadRequestException(
+        `Falha na extração pelo LangChain: ${message}`,
+      );
     }
 
     // Gravação na Base de Dados (Prisma) — o arquivo ORIGINAL e preservado
@@ -144,7 +164,9 @@ export class DocumentsController {
       .indexDocument(content, document.id, document.title, pages)
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[RAG] Falha ao indexar o documento ${document.id}: ${msg}`);
+        console.error(
+          `[RAG] Falha ao indexar o documento ${document.id}: ${msg}`,
+        );
       });
 
     return document;
@@ -167,7 +189,8 @@ export class DocumentsController {
 
   @Get(':id')
   @ApiOperation({
-    summary: 'Metadados de um documento fonte (com links de consulta e download)',
+    summary:
+      'Metadados de um documento fonte (com links de consulta e download)',
   })
   async findOne(@Param('id') id: string) {
     return this.documentsService.findOne(id);
@@ -187,7 +210,8 @@ export class DocumentsController {
     @Res({ passthrough: true }) res: Response,
     @Query('download') download?: string,
   ): Promise<StreamableFile> {
-    const { data, fileName, mimeType } = await this.documentsService.getFile(id);
+    const { data, fileName, mimeType } =
+      await this.documentsService.getFile(id);
     const isDownload =
       download !== undefined && download !== '0' && download !== 'false';
 
@@ -217,21 +241,14 @@ export class DocumentsController {
     summary:
       'Recalcula as coordenadas de um documento ja indexado (nao refaz embeddings)',
   })
-  async backfillLocations(@Param('id') id: string, @Req() req: any) {
-    if (req.user.user_type !== 'ADMINISTRADOR') {
-      throw new ForbiddenException(
-        'Apenas administradores podem reprocessar documentos',
-      );
-    }
+  @Roles(UserType.ADMINISTRADOR)
+  async backfillLocations(@Param('id') id: string) {
     return this.ragService.backfillDocumentLocations(id);
   }
 
   @Delete(':id')
-  @UseGuards(JwtAuthGuard)
-  async remove(@Param('id') id: string, @Req() req: any) {
-    if (req.user.user_type !== 'ADMINISTRADOR') {
-      throw new ForbiddenException('Apenas administradores podem deletar documentos');
-    }
+  @Roles(UserType.ADMINISTRADOR)
+  async remove(@Param('id') id: string) {
     return this.documentsService.remove(id);
   }
 }

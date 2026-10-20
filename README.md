@@ -5,8 +5,8 @@ Este projeto é uma API REST robusta construída com **NestJS** para gestão de 
 ## Arquitetura NestJS
 
 O projeto segue a arquitetura modular do NestJS:
-- **AuthModule**: Gestão de autenticação JWT e estratégias de segurança.
-- **UsersModule**: Gestão de usuários e integração com o banco.
+- **AuthModule**: Login com Google (verificação do ID token), sessão em cookie e RBAC.
+- **UsersModule**: Pré-cadastro de acessos, conclusão de perfil e administração.
 - **DocumentsModule**: Processamento de documentos normativos e upload.
 - **ChatModule**: Orquestração das conversas e histórico.
 - **RagModule**: Inteligência artificial e busca semântica com LangChain.
@@ -18,7 +18,7 @@ O projeto segue a arquitetura modular do NestJS:
 - **Prisma ORM**
 - **PostgreSQL**
 - **LangChain & OpenAI**
-- **Passport JWT**
+- **Passport JWT** + **google-auth-library**
 - **Swagger (OpenAPI)**
 - **Docker**
 - **pnpm** (gerenciador de pacotes)
@@ -28,18 +28,75 @@ O projeto segue a arquitetura modular do NestJS:
 ### Com Docker (Recomendado)
 
 ```bash
-cp .env.example .env    # preencha POSTGRES_PASSWORD, JWT_SECRET e as chaves de IA
+cp .env.example .env    # veja abaixo as variáveis obrigatórias
 docker compose up --build
-curl http://localhost:3000/api
+curl http://localhost:3200/api
 ```
 
 Sobe dois containers: `gefi-postgres` (pgvector) e `gefi-api`. As migrations são
 aplicadas pelo entrypoint antes da API subir.
 
+### Variáveis obrigatórias
+
+A aplicação **não sobe** sem `JWT_SECRET` (mínimo 32 caracteres) e
+`GOOGLE_CLIENT_ID` — a validação em `src/config/env.validation.ts` derruba o boot
+com mensagem explícita. É deliberado: antes havia um segredo padrão no código, e
+um deploy que esquecesse a variável assinava tokens com um valor publicado no
+repositório.
+
+```bash
+openssl rand -hex 64   # gera o JWT_SECRET
+```
+
+Além delas, preencha `POSTGRES_PASSWORD`, as chaves de IA e:
+
+| Variável | Para quê |
+|---|---|
+| `GOOGLE_ALLOWED_HD` | Domínio do Workspace exigido no login (`ifal.edu.br`). Vazio = só a allowlist vale. |
+| `BOOTSTRAP_ADMIN_EMAILS` | Administradores semeados no boot. **Sem ela, um banco novo fica inacessível.** |
+| `COOKIE_SECURE` | `false` apenas em `http://localhost`; `true` em qualquer ambiente publicado. |
+| `CORS_ORIGIN` | Vazio quando o frontend usa o proxy same-origin (caso normal). |
+
+## Autenticação
+
+Não há login por senha. O fluxo é:
+
+1. O navegador obtém um **ID token** do Google e o envia para `POST /api/auth/google`
+2. O backend verifica assinatura, emissor, expiração e `aud` contra as chaves
+   públicas do Google, exige `email_verified` e confere a claim `hd`
+3. Procura o e-mail na tabela `users`. **Sem linha pré-cadastrada: 403.** O Google
+   prova *quem* a pessoa é; quem decide *se* ela entra é o pré-cadastro
+4. Assina o JWT do GeFi e o devolve em `Set-Cookie: gefi_session; HttpOnly; SameSite=Lax`
+
+O `JwtStrategy` relê o usuário no banco a cada requisição, então revogação e
+mudança de cargo valem na hora, sem esperar a expiração do token.
+
+### Cargos
+
+`@Roles(UserType.ADMINISTRADOR)` + `RolesGuard` (em `src/auth/`) restringem rotas.
+Use sempre depois do `JwtAuthGuard`, que é quem preenche `request.user`:
+
+```ts
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(UserType.ADMINISTRADOR)
+```
+
+### Primeiro acesso ao sistema
+
+```bash
+# .env
+BOOTSTRAP_ADMIN_EMAILS=seu.nome@ifal.edu.br
+```
+
+No boot, esses e-mails são criados (ou promovidos) como `ADMINISTRADOR`
+pré-cadastrados. A partir daí o cadastro dos demais é feito pela interface, em
+`/dashboard/users`. A variável também é a forma de recuperar o acesso caso a
+última conta de administrador seja perdida.
+
 #### Deploy no servidor
 
 O serviço `api-deploy` (profile `deploy`) publica na porta **2999**, deixando a
-3000 livre para uso local no mesmo host:
+3200 livre para uso local no mesmo host:
 
 ```bash
 docker compose --profile deploy up -d --build api-deploy
@@ -145,4 +202,4 @@ Documentos enviados **antes** desta funcionalidade não têm arquivo original (`
 ## Documentação
 
 Acesse a documentação interativa em:
-[http://localhost:3000/api-docs](http://localhost:3000/api-docs)
+[http://localhost:3200/api-docs](http://localhost:3200/api-docs)

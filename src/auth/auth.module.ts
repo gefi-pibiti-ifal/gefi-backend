@@ -1,21 +1,24 @@
 import { Module } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
-import { AuthService } from './auth.service';
-import { AuthController } from './auth.controller';
+import { PrismaModule } from '../prisma/prisma.module';
 import { UsersModule } from '../users/users.module';
+import { AuthController } from './auth.controller';
+import { AuthService } from './auth.service';
+import { BootstrapService } from './bootstrap.service';
+import { GoogleService } from './google.service';
 import { JwtStrategy } from './jwt.strategy';
+import { RolesGuard } from './roles.guard';
+import { TokenModule } from './token.module';
 
 @Module({
-  imports: [
-    UsersModule,
-    PassportModule,
-    JwtModule.register({
-      secret: process.env.JWT_SECRET || 'gefi_secret_key_2026',
-      signOptions: { expiresIn: '1d' },
-    }),
+  imports: [UsersModule, PassportModule, PrismaModule, TokenModule],
+  providers: [
+    AuthService,
+    GoogleService,
+    JwtStrategy,
+    RolesGuard,
+    BootstrapService,
   ],
-  providers: [AuthService, JwtStrategy],
   controllers: [AuthController],
   exports: [AuthService],
 })

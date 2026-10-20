@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ForbiddenException, StreamableFile } from '@nestjs/common';
+import { StreamableFile } from '@nestjs/common';
 import { DocumentsController } from './documents.controller';
 import { DocumentsService } from './documents.service';
 import { RagService } from '../rag/rag.service';
@@ -41,7 +41,8 @@ jest.mock('@langchain/community/document_loaders/fs/pdf', () => ({
 }));
 
 const ADMIN = { id: 'user-admin', user_type: 'ADMINISTRADOR' };
-const FISCAL = { id: 'user-fiscal', user_type: 'FISCAL' };
+// FISCAL saiu daqui junto com os casos de cargo, que migraram para
+// src/auth/roles.guard.spec.ts quando a regra virou @Roles + RolesGuard.
 
 function buildFile(): Express.Multer.File {
   const buffer = Buffer.from('%PDF-1.4 conteudo binario do arquivo');
@@ -63,7 +64,10 @@ describe('DocumentsController', () => {
     getContent: jest.Mock;
     remove: jest.Mock;
   };
-  let ragService: { indexDocument: jest.Mock; backfillDocumentLocations: jest.Mock };
+  let ragService: {
+    indexDocument: jest.Mock;
+    backfillDocumentLocations: jest.Mock;
+  };
 
   beforeEach(async () => {
     documentsService = {
@@ -131,7 +135,8 @@ describe('DocumentsController', () => {
         { user: ADMIN },
       );
 
-      const [content, documentId, title, pages] = ragService.indexDocument.mock.calls[0];
+      const [content, documentId, title, pages] =
+        ragService.indexDocument.mock.calls[0];
       expect(documentId).toBe('doc-1');
       expect(title).toBe('IN 05/2017');
       // A pagina 2 do PDF nao tem texto: entra vazia para que a pagina 3
@@ -143,7 +148,11 @@ describe('DocumentsController', () => {
       ]);
       // O texto indexado continua sendo a juncao das paginas COM TEXTO:
       // exatamente o que a extracao sem divisao de paginas produzia.
-      expect(content).toBe(EXTRACTED_PAGES.map((p) => p.text).join('\n\n').trim());
+      expect(content).toBe(
+        EXTRACTED_PAGES.map((p) => p.text)
+          .join('\n\n')
+          .trim(),
+      );
     });
 
     test('total de paginas e o do PDF, nao o das paginas com texto', async () => {
@@ -156,15 +165,10 @@ describe('DocumentsController', () => {
       expect(documentsService.create.mock.calls[0][0].total_pages).toBe(3);
     });
 
-    test('somente administradores enviam documentos', async () => {
-      await expect(
-        controller.upload(
-          buildFile(),
-          { title: 'IN', document_type: 'IN' },
-          { user: FISCAL },
-        ),
-      ).rejects.toThrow(ForbiddenException);
-    });
+    // A restricao de cargo saiu daqui: deixou de ser um `if` dentro do handler
+    // e passou a ser @Roles(ADMINISTRADOR) + RolesGuard, coberto por
+    // src/auth/roles.guard.spec.ts. Testa-la neste arquivo passaria a exercitar
+    // codigo que nao existe mais.
 
     test('arquivo ausente e recusado', async () => {
       await expect(
@@ -202,7 +206,9 @@ describe('DocumentsController', () => {
 
       await controller.getFile('doc-1', res, '1');
 
-      expect(res.set.mock.calls[0][0]['Content-Disposition']).toContain('attachment;');
+      expect(res.set.mock.calls[0][0]['Content-Disposition']).toContain(
+        'attachment;',
+      );
       expect(res.set.mock.calls[0][0]['Content-Disposition']).toContain(
         'filename="in-05-2017.pdf"',
       );
@@ -211,11 +217,15 @@ describe('DocumentsController', () => {
     test('download=0 e download=false continuam sendo visualizacao', async () => {
       const zero = buildResponse();
       await controller.getFile('doc-1', zero, '0');
-      expect(zero.set.mock.calls[0][0]['Content-Disposition']).toContain('inline;');
+      expect(zero.set.mock.calls[0][0]['Content-Disposition']).toContain(
+        'inline;',
+      );
 
       const falsy = buildResponse();
       await controller.getFile('doc-1', falsy, 'false');
-      expect(falsy.set.mock.calls[0][0]['Content-Disposition']).toContain('inline;');
+      expect(falsy.set.mock.calls[0][0]['Content-Disposition']).toContain(
+        'inline;',
+      );
     });
   });
 
@@ -235,18 +245,13 @@ describe('DocumentsController', () => {
   // Reprocessamento de coordenadas (documentos ja indexados)
   // -------------------------------------------------------------------------
   describe('backfillLocations', () => {
-    test('administrador reprocessa as coordenadas', async () => {
-      const result = await controller.backfillLocations('doc-1', { user: ADMIN });
+    test('reprocessa as coordenadas do documento', async () => {
+      const result = await controller.backfillLocations('doc-1');
 
-      expect(ragService.backfillDocumentLocations).toHaveBeenCalledWith('doc-1');
+      expect(ragService.backfillDocumentLocations).toHaveBeenCalledWith(
+        'doc-1',
+      );
       expect(result).toEqual({ documentId: 'doc-1', parents: 3, located: 3 });
-    });
-
-    test('fiscal nao reprocessa', async () => {
-      await expect(
-        controller.backfillLocations('doc-1', { user: FISCAL }),
-      ).rejects.toThrow(ForbiddenException);
-      expect(ragService.backfillDocumentLocations).not.toHaveBeenCalled();
     });
   });
 });
