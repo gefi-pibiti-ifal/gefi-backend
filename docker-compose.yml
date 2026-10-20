@@ -92,6 +92,10 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
       NODE_ENV: ${NODE_ENV:-production}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      # Fixa a porta interna: o PORT do .env (3200, para rodar fora do Docker)
+      # vazaria pelo env_file e a API escutaria numa porta que o mapeamento
+      # e o healthcheck (ambos em 3000) nao alcancam.
+      PORT: "3000"
     ports:
       # 3200 no HOST, 3000 no container.
       #
@@ -134,6 +138,7 @@ services:
       # Com mais de uma replica, mude para false: duas instancias aplicando
       # migrations ao mesmo tempo disputam o lock do Prisma.
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      PORT: "3000"
     ports:
       # Publicado na rede. O ideal e manter "127.0.0.1:2999:3000" e colocar um
       # reverse proxy com TLS na frente (nginx/Caddy/Traefik) -- a aplicacao
