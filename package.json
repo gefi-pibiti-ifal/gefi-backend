@@ -4,7 +4,7 @@
   "description": "",
   "author": "",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "GPL-3.0-or-later",
   "packageManager": "pnpm@11.17.0",
   "engines": {
     "node": ">=22.0.0",
