@@ -1,0 +1,73 @@
+# ==============================================================================
+# Deploy do backend (API + Postgres) no servidor do IFAL.
+#
+# COMO FUNCIONA (sem SSH):
+#   O servidor roda um "self-hosted runner" do GitHub Actions. E ele quem
+#   conecta no GitHub (conexao de SAIDA, HTTPS), recebe este job e executa os
+#   comandos LOCALMENTE no servidor. Por isso funciona mesmo atras do firewall
+#   do IFAL: o GitHub nunca precisa entrar no servidor.
+#
+# QUANDO RODA:
+#   - a cada push na branch main
+#   - manualmente, em GitHub > Actions > "Deploy backend" > Run workflow
+#
+# PRE-REQUISITOS NO SERVIDOR (uma vez so):
+#   - runner instalado com a label `gefi-server`
+#   - arquivo /opt/gefi/backend.env preenchido (segredos ficam SO no servidor)
+# ==============================================================================
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Nunca dois deploys ao mesmo tempo: o segundo espera o primeiro terminar.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, gefi-server]
+    timeout-minutes: 30
+
+    env:
+      ENV_FILE: /opt/gefi/backend.env
+      # Nome FIXO do projeto compose. Nao mude: o frontend se liga a rede
+      # `gefi-backend_default` e o volume do banco e `gefi-backend_postgres_data`.
+      COMPOSE_PROJECT_NAME: gefi-backend
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v5
+
+      - name: Conferir o .env do servidor
+        run: |
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::error::Arquivo $ENV_FILE nao existe no servidor. Crie-o a partir do .env.example."
+            exit 1
+          fi
+
+      - name: Copiar o .env para o diretorio do build
+        run: install -m 600 "$ENV_FILE" .env
+
+      - name: Build e subida (API + Postgres)
+        # --wait: so termina quando os containers estiverem saudaveis
+        # (healthcheck). Se a API nao subir, o job fica vermelho no GitHub.
+        run: |
+          docker compose --profile deploy up -d --build --remove-orphans \
+            --wait --wait-timeout 300 api-deploy
+
+      - name: Mostrar logs da API se falhar
+        if: failure()
+        run: docker compose --profile deploy logs --tail 200 api-deploy postgres || true
+
+      - name: Limpeza
+        if: always()
+        run: |
+          rm -f .env
+          docker image prune -f

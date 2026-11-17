@@ -1,4 +1,5 @@
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
@@ -13,11 +14,31 @@ import { SESSION_COOKIE } from './auth/session.cookie';
 dotenv.config();
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
 
   app.setGlobalPrefix('api');
+
+  // Atras de proxy (Caddy -> Next -> API), o IP do socket e sempre o do
+  // container do frontend. Sem `trust proxy`, o ThrottlerGuard (que usa req.ip)
+  // contaria TODOS os usuarios como um so e o limite de 120 req/min valeria
+  // para o site inteiro. TRUST_PROXY aceita o formato do Express: numero de
+  // saltos, true/false, ou lista de redes (ex.: "loopback, uniquelocal").
+  // So defina quando a API NAO estiver exposta direto a internet.
+  const trustProxy = process.env.TRUST_PROXY?.trim();
+  if (trustProxy) {
+    app.set(
+      'trust proxy',
+      /^\d+$/.test(trustProxy)
+        ? Number(trustProxy)
+        : trustProxy === 'true'
+          ? true
+          : trustProxy === 'false'
+            ? false
+            : trustProxy,
+    );
+  }
 
   // Necessario para que a JwtStrategy consiga ler o token: ele vive no cookie
   // httpOnly, e sem este middleware `req.cookies` simplesmente nao existe.
