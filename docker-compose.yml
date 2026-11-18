@@ -139,6 +139,10 @@ services:
       # migrations ao mesmo tempo disputam o lock do Prisma.
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
       PORT: "3000"
+      # No deploy a API so recebe trafego pelo proxy do frontend (Caddy -> Next),
+      # todos em redes privadas do Docker: confia nesses saltos para que req.ip
+      # (usado pelo rate limit) seja o IP real do usuario.
+      TRUST_PROXY: ${TRUST_PROXY:-loopback, linklocal, uniquelocal}
     ports:
       # Publicado na rede. O ideal e manter "127.0.0.1:2999:3000" e colocar um
       # reverse proxy com TLS na frente (nginx/Caddy/Traefik) -- a aplicacao
